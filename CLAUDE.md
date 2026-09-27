@@ -66,6 +66,12 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-27 実装フェーズ1完了**: `cargo init`でRustプロジェクトを作成。
+  [`src/reality.rs`](src/reality.rs)にREALITYの核心ロジック(認証判定→
+  フォールバック転送)、[`src/integration.rs`](src/integration.rs)に
+  `aruaru-llm`/`open-cuda`向けの連携トレイト(既定は何もしないフォール
+  バック実装、両リポジトリが育ったら差し替え可能)を実装。`cargo test`で
+  8テスト全通過。実TLS層への統合(uTLS指紋偽装等)は未着手。
 - **2026-09-27 リポジトリ新設+プロトコル選定(2回改訂)**:
   `aon-co-jp/aruaru-vpn`を新規作成。Outline VPN/Algo VPNのアーキテクチャ
   調査、開発方針(用途を隠さない、aon-co-jpは中継を運営しない)、透明性

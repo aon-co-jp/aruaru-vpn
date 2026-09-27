@@ -109,14 +109,38 @@ eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.
 本体を単独で実装し、連携部分は各リポジトリの状況を見ながら段階的に
 組み込む方針とする。
 
+## 9. 実装フェーズ1(完了・2026-09-27): REALITY核心ロジック+連携インターフェース
+
+`cargo init`でRustプロジェクトを作成。以下2モジュールを実装、`cargo test`
+で8テスト全通過。
+
+- [`src/reality.rs`](src/reality.rs): REALITYの核心である「認証成功/失敗
+  判定→フォールバック転送」ロジックを最小実装。`RealityAuthChecker`が
+  short_id(利用者ごとの短い識別子)を検証し、`decide_connection_action`が
+  認証成功なら`ConnectionAction::Relay`(プロキシとして処理)、失敗なら
+  `ConnectionAction::Fallback { camouflage_target }`(偽装先サイトへの
+  そのままの転送)を返す。実際のTLS ClientHelloの偽装・uTLS指紋偽装は
+  未実装(次フェーズ)。
+- [`src/integration.rs`](src/integration.rs): `aruaru-llm`(通信パターン
+  擬態)・`open-cuda`(GPU高速化)との連携を、**トレイト(契約)として先に
+  定義**した。既定実装(`NoOpTrafficShaper`/`CpuOnlyCryptoAccelerator`)は
+  何もしないフォールバックとして機能するため、`aruaru-llm`/`open-cuda`が
+  未成熟な現時点でもビルド・テストが通る。両リポジトリ側の実装が育ったら、
+  これらのトレイトを実装する型に差し替えるだけで実際の連携に移行できる
+  設計。
+
+**未実施(次フェーズ)**: 実際のTLS ClientHelloレベルでのREALITY偽装
+(uTLS相当の指紋偽装、X25519鍵共有への認証情報埋め込み)、`boringtun`
+アーキテクチャ調査によるWireGuard+AmneziaWG側の実装、`aruaru-llm`/
+`open-cuda`が育った際の実際のトレイト実装差し替え。
+
 ## 次回再開ポイント
 
+- **REALITYの実TLS層統合**: 現状は「判定ロジックのみ」の最小実装。実際の
+  TLSハンドシェイク(ClientHelloの構造・X25519鍵共有・uTLS指紋偽装)への
+  統合を、`xray-lite`等のアーキテクチャ(コードは流用せず)を参考に設計する。
 - 上記2(実装言語・基盤)の詳細、`boringtun`のアーキテクチャ調査(コードは
   流用せず、Noiseプロトコルハンドシェイク等の設計思想のみ参考にする)。
-- **VLESS+REALITY型の詳細設計**: REALITYのTLSハンドシェイク偽装・uTLS
-  指紋偽装・認証失敗時のトラフィック転送の仕組みを、`xray-lite`等の
-  アーキテクチャ(コードは流用せず)を参考に、Rust + `RPoem`で一から
-  設計する。
 - **AmneziaWG型難読化層の設計**(WireGuard基本実装と同時開発、ユーザー
   指示2026-09-27): AmneziaWGの公開プロトコル仕様・設計思想(パケットの
   ヘッダー偽装・タイミング撹乱等でHTTPS風に見せる手法)をGoogle検索・
