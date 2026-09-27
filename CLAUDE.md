@@ -16,6 +16,20 @@
 OSSテンプレート。**aon-co-jpは中継サーバーを運営しない**(テンプレートの
 配布のみ)。詳細な構想・開発の経緯は[`README.md`](README.md)を参照。
 
+## 重要方針: 暗号プリミティブは自作しない(2026-09-27決定)
+
+「既存実装のコードを一切流用せず一から開発する」というエコシステム共通
+方針は、**アプリケーション/プロトコルのアーキテクチャ**に適用するもので
+あり、**暗号アルゴリズムそのもの(X25519・AES・ChaCha20・SHA-2・Noise
+プロトコル等)の独自実装には適用しない**。暗号プリミティブを自作する
+ことは、たとえ動いているように見えても重大な脆弱性を生みやすい、
+というのが暗号工学における一般的な原則であるため、監査済みの
+Rust crate([x25519-dalek](https://crates.io/crates/x25519-dalek)、
+[hkdf](https://crates.io/crates/hkdf)、[snow](https://crates.io/crates/snow)
+等)に委ねる。参考にする範囲は「これらのライブラリの上にどう
+REALITY/WireGuard相当のプロトコルを組み立てるか」というアーキテクチャ
+部分のみ。
+
 ## 最重要方針: 用途を隠さない(2026-09-27決定)
 
 このリポジトリの存在意義は「正直さ」にある。開発・ドキュメント・配布方法の
@@ -66,6 +80,12 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-27 実装フェーズ3完了**: [`src/reality_auth.rs`](src/reality_auth.rs)
+  にX25519 ECDH+HKDFによるREALITY本来の認証タグ検証(暗号プリミティブは
+  x25519-dalek/hkdf crateに委ねる)、[`src/wireguard_handshake.rs`](src/wireguard_handshake.rs)
+  にWireGuard相当のNoise_IKハンドシェイク(snow crateを土台)を実装。
+  `cargo test`で26テスト全通過。TLS層(key_share拡張)への統合、
+  AmneziaWGジャンクパケットとの組み合わせ、PSK追加は未着手。
 - **2026-09-27 実装フェーズ2完了**: [`src/tls_clienthello.rs`](src/tls_clienthello.rs)
   にTLS ClientHelloの最小パーサー(SNI・session_id抽出)、
   [`src/amnezia.rs`](src/amnezia.rs)にAmneziaWGの核心機構(ジャンク

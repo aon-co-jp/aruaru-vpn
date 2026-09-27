@@ -153,19 +153,44 @@ eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.
   設計パターン)。WireGuard本体の暗号処理(Noiseハンドシェイク)には
   まだ踏み込んでいない。
 
-**未実施(次フェーズ)**: X25519鍵共有への認証情報埋め込み・uTLS指紋偽装
-(現状は`session_id`をそのまま`short_id`として扱う簡略化版)、WireGuard
-本体の暗号処理(`boringtun`アーキテクチャ調査)、`aruaru-llm`/`open-cuda`が
-育った際の実際のトレイト実装差し替え。
+## 11. 実装フェーズ3(完了・2026-09-27): X25519認証+WireGuard Noiseハンドシェイク
+
+ユーザー指示「未実装(X25519鍵共有・WireGuard暗号処理)を実装して」を受け、
+以下2モジュールを実装。`cargo test`で26テスト全通過(既存19+新規7)。
+**暗号プリミティブ(X25519・HKDF・Noiseハンドシェイク)は自作せず、
+監査済みのRust crate([x25519-dalek](https://crates.io/crates/x25519-dalek)、
+[hkdf](https://crates.io/crates/hkdf)、[snow](https://crates.io/crates/snow))
+を使用する**(暗号アルゴリズムの独自実装は「他プロジェクトのコードを
+流用しない」方針の対象外とする一般的ベストプラクティス、詳細は
+[`CLAUDE.md`](CLAUDE.md)参照)。
+
+- [`src/reality_auth.rs`](src/reality_auth.rs): REALITY本来の認証方式
+  (X25519 ECDH → HKDFで認証タグ導出 → 定数時間比較で検証)を実装。
+  `reality.rs`の簡略版(`session_id`を`short_id`としてそのまま比較)を
+  置き換える本格実装。「正規クライアントの公開鍵は見えても対応する秘密鍵を
+  持たない攻撃者は正しいタグを計算できない」ことをテストで確認。
+  **未統合**: TLS ClientHelloの`key_share`拡張から実際にクライアントの
+  エフェメラル公開鍵を抽出する処理(`tls_clienthello.rs`側の拡張が必要)は
+  次フェーズ。
+- [`src/wireguard_handshake.rs`](src/wireguard_handshake.rs): WireGuardが
+  使う`Noise_IK`パターンによるハンドシェイクを、`snow`クレートを土台に
+  実装。イニシエーター・レスポンダー間で実際にメッセージを往復させ、
+  `TransportState`(暗号化データ通信状態)への遷移・実際の暗号化/復号まで
+  確認。ただしNoise IK単体では「見知らぬイニシエーターの拒否」はできない
+  (誰でもレスポンダーと鍵交換自体はできてしまう)ことをテストで明示し、
+  上位層(REALITY相当の認証・許可リスト)との役割分担を設計として記録。
+  **未統合**: `amnezia.rs`のジャンクパケット送信計画との組み合わせ、
+  PSK(事前共有鍵、`Noise_IKpsk2`)の追加は次フェーズ。
 
 ## 次回再開ポイント
 
-- **X25519鍵共有への認証情報埋め込み・uTLS指紋偽装**: 現状の
-  `session_id`直接比較という簡略化を、実際のREALITY仕様(HMAC/鍵導出を
-  使った認証)に近づける。
-- **WireGuard本体の暗号処理**: `boringtun`のアーキテクチャ調査(コードは
-  流用せず、Noiseプロトコルハンドシェイク等の設計思想のみ参考にする)。
-  `amnezia.rs`の送信計画と実際に組み合わせる。
+- **REALITY認証のTLS層統合**: `tls_clienthello.rs`に`key_share`拡張の
+  パースを追加し、`reality_auth.rs`の検証を実際のTLSハンドシェイクへ
+  組み込む。
+- **WireGuard+AmneziaWGの統合**: `wireguard_handshake.rs`のメッセージ送信を
+  `amnezia.rs`の送信計画(ジャンクパケット→実メッセージ)でラップする。
+- **PSK(Noise_IKpsk2)の追加**: WireGuard本来の事前共有鍵によるさらなる
+  耐量子性の考慮。
 - 上記3(配布形態)・4(鍵管理)の検討。
 - 透明性告知文の残り約100言語への翻訳拡張、ネイティブ検証の依頼。
 - 実際のWebアプリ/クライアントUIへの「目立つ場所へのリンク設置」実装

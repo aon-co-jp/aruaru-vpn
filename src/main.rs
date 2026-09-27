@@ -1,7 +1,9 @@
 mod amnezia;
 mod integration;
 mod reality;
+mod reality_auth;
 mod tls_clienthello;
+mod wireguard_handshake;
 
 use amnezia::{plan_handshake_send_sequence, ObfuscationConfig};
 use integration::{CpuOnlyCryptoAccelerator, CryptoAccelerator, NoOpTrafficShaper, TrafficShaper};
