@@ -41,13 +41,11 @@
 
 ## 未確定事項(次回セッションで詰める)
 
-1. **プロトコル選定**: Shadowsocks型(検閲耐性重視)かWireGuard型
-   (速度重視)か、あるいは両対応か。`open-tv-chat`の通話トラフィックとは
-   別物(こちらは汎用インターネットアクセス全般が対象)なので、
-   `open-LiveKit`の踏み台とは独立した技術選定が必要。
-2. **実装言語・基盤**: Rust + `open-web-server`を軸にする想定だが、
-   Shadowsocks/WireGuardの既存Rust実装(参考にする範囲・流用しない範囲の
-   線引き含む)の調査が必要。
+1. ~~プロトコル選定~~ → **2026-09-27完了**、下記「7. プロトコル選定」参照。
+2. **実装言語・基盤**: Rust + `open-web-server`を軸にする想定。
+   [boringtun](https://github.com/cloudflare/boringtun)(Cloudflare製、
+   BSD-3-Clause)のアーキテクチャを参考にしつつコードは流用せず一から実装
+   する。
 3. **配布形態**: VPS向けセットアップスクリプト/コンテナイメージ、利用者
    端末向けクライアント(Windows/macOS/Linux/Android/iPhone)の両方が必要。
 4. **鍵管理・利用者ごとのアクセス制御方式**。
@@ -63,10 +61,32 @@
 言語セットへ翻訳した(効率のため既存の言語リストを再利用)。AI翻訳のため
 ネイティブ検証前である旨を明記。残り約100言語は今後追加。
 
+## 7. プロトコル選定(2026-09-27完了)
+
+Shadowsocks型/WireGuard型/AmneziaWG型/VLESS+REALITY型をGoogle検索で比較調査
+(2026年時点の実情: 素のShadowsocksは強い検閲に単体では不十分になりつつある、
+素のWireGuardは高性能だがUDPパターンがGFW等に検出されやすい、AmneziaWGは
+WireGuardをHTTPS風に難読化しDPI対策に有効、VLESS+REALITYは2026年時点の
+検閲回避の実質的業界標準だが主要実装がGo〈Xray-core〉でRust実装は未成熟)。
+
+**決定(2026-09-27、ユーザー指示で同時開発に変更)**: **WireGuard型を基本
+として採用**(Rust実装の[boringtun](https://github.com/cloudflare/boringtun)
+がCloudflare製・BSD-3-Clauseで、iOS/Android/Cloudflareサーバーに数百万台
+規模の実績がありRustエコシステムとして最も成熟しているため)し、
+**AmneziaWG型の難読化層(HTTPS風に見せかけDPI/検閲を回避)を第一弾から
+同時に開発する**(段階分けせず、最初から両方を一体のスコープとする)。
+VLESS+REALITYはRust実装の未成熟さを理由に今回は見送り。詳細比較表は
+[`README.md`](README.md)「技術選定」を参照。
+
 ## 次回再開ポイント
 
-- 上記1(プロトコル選定)から、Google検索・GitHub調査を経てじっくり検討する
-  (`open-LiveKit`と同じ開発姿勢)。決め打ちせず、比較表を作ってから決定する。
+- 上記2(実装言語・基盤)の詳細、`boringtun`のアーキテクチャ調査(コードは
+  流用せず、Noiseプロトコルハンドシェイク等の設計思想のみ参考にする)。
+- **AmneziaWG型難読化層の設計**(WireGuard基本実装と同時開発、ユーザー
+  指示2026-09-27): AmneziaWGの公開プロトコル仕様・設計思想(パケットの
+  ヘッダー偽装・タイミング撹乱等でHTTPS風に見せる手法)をGoogle検索・
+  GitHub調査で詳細調査した上で、コードは流用せず一から実装する。
+- 上記3(配布形態)・4(鍵管理)の検討。
 - 透明性告知文の残り約100言語への翻訳拡張、ネイティブ検証の依頼。
 - 実際のWebアプリ/クライアントUIへの「目立つ場所へのリンク設置」実装
   (実装フェーズ未着手のため、クライアント実装と合わせて行う)。

@@ -41,15 +41,23 @@ OSSテンプレート。**aon-co-jpは中継サーバーを運営しない**(テ
 [`open-LiveKit`のPORTING.md](https://github.com/aon-co-jp/open-LiveKit/blob/main/PORTING.md)
 「8. 踏み台の用途スコープの検討経緯」を参照。
 
-## 技術方針(未着手)
+## 技術方針
 
-- プロトコル・配布形態・鍵管理方式はいずれも未確定。[`README.md`](README.md)
-  「技術選定(未着手)」を参照。決め打ちせず、実装着手時にGoogle検索・GitHub
-  調査を経て決定する(`open-LiveKit`と同じ開発姿勢)。
+- **プロトコル**: WireGuard型を基本として採用し、**AmneziaWG型の難読化層を
+  第一弾から同時開発**する(2026-09-27ユーザー指示。段階分けせず最初から
+  一体のスコープ)。Rust実装[boringtun](https://github.com/cloudflare/boringtun)
+  がCloudflare製・BSD-3-Clauseで最も成熟していることが採用理由。
+  VLESS+REALITYはRust実装未成熟のため見送り。
+- 配布形態・鍵管理方式は未確定。[`README.md`](README.md)「技術選定」を
+  参照。決め打ちせず、実装着手時にGoogle検索・GitHub調査を経て決定する
+  (`open-LiveKit`と同じ開発姿勢)。
 
 ## HANDOFF
 
-- **2026-09-27 リポジトリ新設**: `aon-co-jp/aruaru-vpn`を新規作成。
-  Outline VPN/Algo VPNのアーキテクチャ調査と開発方針(用途を隠さない、
-  aon-co-jpは中継を運営しない)を決定した段階。実装は未着手。次回再開時は
+- **2026-09-27 リポジトリ新設+プロトコル選定**: `aon-co-jp/aruaru-vpn`を
+  新規作成。Outline VPN/Algo VPNのアーキテクチャ調査、開発方針(用途を
+  隠さない、aon-co-jpは中継を運営しない)、透明性告知文(日英+主要30ヶ国語)、
+  プロトコル選定(WireGuard型を基本に、AmneziaWG型難読化層を第一弾から
+  同時開発、ユーザー指示で段階分けせず一体化)まで完了。実装は未着手。
+  次回再開時は
   [`PORTING.md`](PORTING.md)の「次回再開ポイント」を参照。
