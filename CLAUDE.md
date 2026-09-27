@@ -66,6 +66,12 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-27 実装フェーズ2完了**: [`src/tls_clienthello.rs`](src/tls_clienthello.rs)
+  にTLS ClientHelloの最小パーサー(SNI・session_id抽出)、
+  [`src/amnezia.rs`](src/amnezia.rs)にAmneziaWGの核心機構(ジャンク
+  パケット送信計画)を実装。`reality.rs`に`decide_from_client_hello_record`
+  を追加しTLS層と統合。`cargo test`で19テスト全通過。X25519鍵共有への
+  認証情報埋め込み・uTLS指紋偽装・WireGuard本体の暗号処理は未着手。
 - **2026-09-27 実装フェーズ1完了**: `cargo init`でRustプロジェクトを作成。
   [`src/reality.rs`](src/reality.rs)にREALITYの核心ロジック(認証判定→
   フォールバック転送)、[`src/integration.rs`](src/integration.rs)に

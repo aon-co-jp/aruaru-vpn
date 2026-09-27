@@ -83,6 +83,27 @@ pub fn decide_connection_action(
     }
 }
 
+/// 生のTLS ClientHelloレコードを受け取り、[`crate::tls_clienthello`]で
+/// パースした`session_id`を認証情報として使って接続の振る舞いを決定する。
+///
+/// 偽装先(`camouflage_target`)は、ClientHelloのSNIが指定されていれば
+/// それを優先し(利用者が実際にアクセスしようとしたサイトへそのまま
+/// 転送する方が、検閲側から見て一貫性がある)、無ければ設定値
+/// `default_camouflage_target`を使う。
+pub fn decide_from_client_hello_record(
+    checker: &RealityAuthChecker,
+    record: &[u8],
+    default_camouflage_target: &str,
+) -> Result<ConnectionAction, crate::tls_clienthello::ParseError> {
+    let parsed = crate::tls_clienthello::parse_client_hello(record)?;
+    let camouflage_target = parsed.server_name.as_deref().unwrap_or(default_camouflage_target);
+    Ok(decide_connection_action(
+        checker,
+        &parsed.session_id,
+        camouflage_target,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +137,33 @@ mod tests {
     fn decide_connection_action_falls_back_with_camouflage_target_when_unauthenticated() {
         let checker = RealityAuthChecker::new([vec![7, 7, 7]]);
         let action = decide_connection_action(&checker, &[0, 0, 0], "www.microsoft.com");
+        assert_eq!(
+            action,
+            ConnectionAction::Fallback {
+                camouflage_target: "www.microsoft.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn decide_from_client_hello_record_authenticates_when_session_id_matches() {
+        use crate::tls_clienthello::tests_support::build_client_hello_for_tests;
+
+        let checker = RealityAuthChecker::new([b"good-short-id".to_vec()]);
+        let record = build_client_hello_for_tests(b"good-short-id", "www.microsoft.com");
+        let action =
+            decide_from_client_hello_record(&checker, &record, "fallback.example").unwrap();
+        assert_eq!(action, ConnectionAction::Relay);
+    }
+
+    #[test]
+    fn decide_from_client_hello_record_falls_back_to_sni_when_unauthenticated() {
+        use crate::tls_clienthello::tests_support::build_client_hello_for_tests;
+
+        let checker = RealityAuthChecker::new([b"good-short-id".to_vec()]);
+        let record = build_client_hello_for_tests(b"wrong-id", "www.microsoft.com");
+        let action =
+            decide_from_client_hello_record(&checker, &record, "fallback.example").unwrap();
         assert_eq!(
             action,
             ConnectionAction::Fallback {

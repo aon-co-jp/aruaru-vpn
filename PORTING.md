@@ -129,22 +129,43 @@ eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.
   これらのトレイトを実装する型に差し替えるだけで実際の連携に移行できる
   設計。
 
-**未実施(次フェーズ)**: 実際のTLS ClientHelloレベルでのREALITY偽装
-(uTLS相当の指紋偽装、X25519鍵共有への認証情報埋め込み)、`boringtun`
-アーキテクチャ調査によるWireGuard+AmneziaWG側の実装、`aruaru-llm`/
-`open-cuda`が育った際の実際のトレイト実装差し替え。
+## 10. 実装フェーズ2(完了・2026-09-27): TLS ClientHello解析+AmneziaWG核心機構
+
+ユーザー指示「TLS層への統合(xray-lite参考)+WireGuard/AmneziaWG側の実装を
+同時に進めて」を受け、以下2モジュールを実装。`cargo test`で19テスト全通過
+(既存8+新規11)。
+
+- [`src/tls_clienthello.rs`](src/tls_clienthello.rs): TLS `ClientHello`の
+  ワイヤーフォーマットを手作業で最小限パースし、**SNI(接続先ホスト名)**と
+  **session_id(REALITYが認証情報を埋め込む場所)**を抽出する。`rustls`等の
+  完全なTLS実装には頼らない(認証前に通常のTLSサーバーとして応答しては
+  ならないため、生バイトを覗き見る必要がある、というREALITYの本質的な
+  要件による設計判断)。
+- [`src/reality.rs`](src/reality.rs): `decide_from_client_hello_record`を
+  追加し、生のTLSレコードから直接、認証判定→接続アクション決定まで一気通貫
+  で行えるようにした(`tls_clienthello`との統合)。SNIが取れた場合は偽装先
+  としてそのSNI自体を使う(利用者が実際にアクセスしようとしたサイトへ
+  転送する方が検閲側から見て一貫性がある、という設計判断)。
+- [`src/amnezia.rs`](src/amnezia.rs): AmneziaWGの核心機構である
+  「ハンドシェイクパケットの前にランダムな個数・サイズのジャンクパケットを
+  挟む」という送信計画(`Jc`/`Jmin`/`Jmax`相当)を、乱数は外部注入・
+  決定的にテスト可能な形で実装(`open-LiveKit`の`NodePool::pick`と同じ
+  設計パターン)。WireGuard本体の暗号処理(Noiseハンドシェイク)には
+  まだ踏み込んでいない。
+
+**未実施(次フェーズ)**: X25519鍵共有への認証情報埋め込み・uTLS指紋偽装
+(現状は`session_id`をそのまま`short_id`として扱う簡略化版)、WireGuard
+本体の暗号処理(`boringtun`アーキテクチャ調査)、`aruaru-llm`/`open-cuda`が
+育った際の実際のトレイト実装差し替え。
 
 ## 次回再開ポイント
 
-- **REALITYの実TLS層統合**: 現状は「判定ロジックのみ」の最小実装。実際の
-  TLSハンドシェイク(ClientHelloの構造・X25519鍵共有・uTLS指紋偽装)への
-  統合を、`xray-lite`等のアーキテクチャ(コードは流用せず)を参考に設計する。
-- 上記2(実装言語・基盤)の詳細、`boringtun`のアーキテクチャ調査(コードは
+- **X25519鍵共有への認証情報埋め込み・uTLS指紋偽装**: 現状の
+  `session_id`直接比較という簡略化を、実際のREALITY仕様(HMAC/鍵導出を
+  使った認証)に近づける。
+- **WireGuard本体の暗号処理**: `boringtun`のアーキテクチャ調査(コードは
   流用せず、Noiseプロトコルハンドシェイク等の設計思想のみ参考にする)。
-- **AmneziaWG型難読化層の設計**(WireGuard基本実装と同時開発、ユーザー
-  指示2026-09-27): AmneziaWGの公開プロトコル仕様・設計思想(パケットの
-  ヘッダー偽装・タイミング撹乱等でHTTPS風に見せる手法)をGoogle検索・
-  GitHub調査で詳細調査した上で、コードは流用せず一から実装する。
+  `amnezia.rs`の送信計画と実際に組み合わせる。
 - 上記3(配布形態)・4(鍵管理)の検討。
 - 透明性告知文の残り約100言語への翻訳拡張、ネイティブ検証の依頼。
 - 実際のWebアプリ/クライアントUIへの「目立つ場所へのリンク設置」実装
