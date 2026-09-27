@@ -43,21 +43,26 @@ OSSテンプレート。**aon-co-jpは中継サーバーを運営しない**(テ
 
 ## 技術方針
 
-- **プロトコル**: WireGuard型を基本として採用し、**AmneziaWG型の難読化層を
-  第一弾から同時開発**する(2026-09-27ユーザー指示。段階分けせず最初から
-  一体のスコープ)。Rust実装[boringtun](https://github.com/cloudflare/boringtun)
-  がCloudflare製・BSD-3-Clauseで最も成熟していることが採用理由。
-  VLESS+REALITYはRust実装未成熟のため見送り。
+- **プロトコル**: **WireGuard+AmneziaWG型(高速・軽量)と
+  VLESS+REALITY型(検閲耐性最強、TLS偽装)を並行して同時開発**する
+  (2026-09-27最終決定)。当初VLESS+REALITYは「Rust実装未成熟」を理由に
+  見送ったが、ユーザーから「世界中の言語でGoogle検索・GitHub調査をして
+  冷静に検討して」と再検討を求められ、実際には[xray-lite](https://github.com/undead-undead/xray-lite)
+  等の本番志向Rust実装が既に存在することが判明し、判断を訂正した
+  (**事実誤認は必ず訂正すること**、というエコシステム共通の教訓)。
 - 配布形態・鍵管理方式は未確定。[`README.md`](README.md)「技術選定」を
   参照。決め打ちせず、実装着手時にGoogle検索・GitHub調査を経て決定する
   (`open-LiveKit`と同じ開発姿勢)。
 
 ## HANDOFF
 
-- **2026-09-27 リポジトリ新設+プロトコル選定**: `aon-co-jp/aruaru-vpn`を
-  新規作成。Outline VPN/Algo VPNのアーキテクチャ調査、開発方針(用途を
-  隠さない、aon-co-jpは中継を運営しない)、透明性告知文(日英+主要30ヶ国語)、
-  プロトコル選定(WireGuard型を基本に、AmneziaWG型難読化層を第一弾から
-  同時開発、ユーザー指示で段階分けせず一体化)まで完了。実装は未着手。
-  次回再開時は
+- **2026-09-27 リポジトリ新設+プロトコル選定(2回改訂)**:
+  `aon-co-jp/aruaru-vpn`を新規作成。Outline VPN/Algo VPNのアーキテクチャ
+  調査、開発方針(用途を隠さない、aon-co-jpは中継を運営しない)、透明性
+  告知文(日英+主要30ヶ国語)を作成。プロトコルは当初WireGuard+AmneziaWG
+  のみに決定したが、ユーザーから「VLESS+REALITYもRust+RPoemで世界中の
+  言語でGoogle検索・GitHub調査して冷静に検討して」と再調査を求められ、
+  「Rust実装は未成熟」という当初判断が誤りだったと判明(xray-lite等の
+  本番志向実装が実在)。最終的に**WireGuard+AmneziaWGとVLESS+REALITYを
+  並行して同時開発**する方針に確定。実装は未着手。次回再開時は
   [`PORTING.md`](PORTING.md)の「次回再開ポイント」を参照。

@@ -62,28 +62,32 @@ OSSテンプレート**。
 
 ## 技術選定(2026-09-27調査完了)
 
-### プロトコル: WireGuard型を採用、将来的にAmneziaWG型の難読化を追加検討
+### プロトコル: WireGuard+AmneziaWGとVLESS+REALITYを並行して同時開発(2026-09-27最終決定)
 
-Google検索で2026年時点の実情を調査した結果を比較する。
+Google検索・GitHub調査で2026年時点の実情を調査した結果を比較する。
 
 | 方式 | 検閲耐性 | 性能 | 備考 |
 |---|---|---|---|
 | 素のShadowsocks | 2026年時点では単体では強い検閲に対して不十分になってきている | 中(shadowsocks-2022はむしろ高速) | 検出技術の進歩が速く、単体使用は非推奨との指摘あり |
 | 素のWireGuard | UDPの通信パターンが中国のGFW等の高度な検閲に検出されやすい | 高(カーネルモード実装で高速・軽量) | 検閲の無い/弱い環境では最有力 |
 | AmneziaWG(WireGuardの難読化拡張) | WireGuardの通信を通常のHTTPS風に偽装し、DPI回避に有効 | 高(WireGuardベースを維持) | 2026年時点でDPI対策として有効との評価 |
-| VLESS + REALITY(Xray-core等) | 2026年時点の「業界標準」的な検閲回避方式(TLS偽装が高度) | 中〜高 | 主要実装はGo(Xray-core)、Rust実装は未成熟 |
+| VLESS + REALITY(Xray-core等) | 2026年時点の「業界標準」的な検閲回避方式。正規サイト(例: microsoft.com)のTLS証明書・ハンドシェイクをそのまま借用し、認証失敗時はそのターゲットサイトへ普通に転送するため、検閲側は「本物のサイトへのアクセス」と区別できない | 中〜高 | **再調査の結果、Rust実装は既に成熟**(下記参照)。当初「未成熟」と判断していたが誤りだった |
 
-**決定(2026-09-27、ユーザー指示で同時開発に変更)**: 高速・軽量で実績豊富、
-かつRust実装([boringtun](https://github.com/cloudflare/boringtun)、
-Cloudflare製・BSD-3-Clause、iOS/Android/Cloudflareサーバーで数百万台規模の
-実績)が既に成熟している**WireGuard型を基本として採用**し、
-**AmneziaWG型の難読化層(通信をHTTPS風に見せかけ、DPI/検閲を回避する層)を
-最初から同時に開発する**(「まず基本〈WireGuard型〉があり、その上に
-難読化を後付けする」段階分けではなく、両方を一体として第一弾スコープに
-含める、というユーザー指示)。いずれもboringtun/AmneziaWGのコードは流用
-せず、公開されているプロトコル仕様・設計思想のみを参考に一から実装する
-(既存方針どおり)。VLESS+REALITYは2026年時点で検閲回避の実質的な業界標準
-だが、主要実装がGo(Xray-core)でありRust実装が未成熟なため、今回は見送る。
+**再調査で判明した事実**: 当初「VLESS+REALITYはGo実装〈Xray-core〉が主体で
+Rust実装は未成熟」と判断したが、GitHub上には実際に本番志向のRust実装が
+複数存在する: [xray-lite](https://github.com/undead-undead/xray-lite)
+(MPL-2.0、197★、348コミット、VLESS+REALITY+XHTTPを完全実装、
+eBPF/XDPカーネル最適化版もあり)、
+[rust-reality](https://github.com/jacek4yang/rust-reality)、
+[xray-rust](https://github.com/aimalygin/xray-rust)。この事実誤認を
+ユーザーに指摘され、判断を訂正した。
+
+**最終決定**: **WireGuard+AmneziaWG(高速・軽量、検閲の弱い環境向け)と
+VLESS+REALITY(正規サイトへの偽装により最も検出されにくい、検閲の強い
+環境向け)を並行して同時開発**し、利用者が自分のネットワーク状況に応じて
+プロトコルを選択できるようにする。いずれもboringtun/AmneziaWG/xray-lite等
+のコードは流用せず、公開されているプロトコル仕様・設計思想のみを参考に
+Rust + `open-web-server`/`RPoem`で一から実装する(既存方針どおり)。
 
 ### 配布形態・鍵管理(未着手、引き続き検討)
 

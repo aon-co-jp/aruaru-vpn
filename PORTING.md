@@ -69,19 +69,33 @@ Shadowsocks型/WireGuard型/AmneziaWG型/VLESS+REALITY型をGoogle検索で比�
 WireGuardをHTTPS風に難読化しDPI対策に有効、VLESS+REALITYは2026年時点の
 検閲回避の実質的業界標準だが主要実装がGo〈Xray-core〉でRust実装は未成熟)。
 
-**決定(2026-09-27、ユーザー指示で同時開発に変更)**: **WireGuard型を基本
-として採用**(Rust実装の[boringtun](https://github.com/cloudflare/boringtun)
-がCloudflare製・BSD-3-Clauseで、iOS/Android/Cloudflareサーバーに数百万台
-規模の実績がありRustエコシステムとして最も成熟しているため)し、
-**AmneziaWG型の難読化層(HTTPS風に見せかけDPI/検閲を回避)を第一弾から
-同時に開発する**(段階分けせず、最初から両方を一体のスコープとする)。
-VLESS+REALITYはRust実装の未成熟さを理由に今回は見送り。詳細比較表は
+**当初の判断(誤り)**: VLESS+REALITYはRust実装が未成熟と判断し見送った。
+
+**再調査(2026-09-27、ユーザーから「世界中の言語でGoogle検索・GitHub調査を
+した上で冷静に検討して」との指示)**: 実際にはGitHub上に本番志向のRust実装
+が複数存在することが判明した([xray-lite](https://github.com/undead-undead/xray-lite)
+はMPL-2.0・197★・348コミットでVLESS+REALITY+XHTTPを完全実装、
+eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.com/jacek4yang/rust-reality)、
+[xray-rust](https://github.com/aimalygin/xray-rust)も存在)。REALITYの
+仕組み(正規サイトのTLS証明書・ハンドシェイクを借用し、認証失敗時はその
+サイトへ普通に転送するため検閲側が区別できない)も確認した。この事実誤認を
+ユーザーに指摘され、判断を訂正した。
+
+**最終決定**: **WireGuard型+AmneziaWG型難読化層(高速・軽量、検閲の弱い
+環境向け)と、VLESS+REALITY型(検閲の強い環境向け、最も検出されにくい)を
+並行して同時開発**する。利用者がネットワーク状況に応じてプロトコルを
+選択できるようにする。いずれもコードは流用せず、公開仕様・設計思想のみを
+参考にRust + `open-web-server`/`RPoem`で一から実装する。詳細比較表は
 [`README.md`](README.md)「技術選定」を参照。
 
 ## 次回再開ポイント
 
 - 上記2(実装言語・基盤)の詳細、`boringtun`のアーキテクチャ調査(コードは
   流用せず、Noiseプロトコルハンドシェイク等の設計思想のみ参考にする)。
+- **VLESS+REALITY型の詳細設計**: REALITYのTLSハンドシェイク偽装・uTLS
+  指紋偽装・認証失敗時のトラフィック転送の仕組みを、`xray-lite`等の
+  アーキテクチャ(コードは流用せず)を参考に、Rust + `RPoem`で一から
+  設計する。
 - **AmneziaWG型難読化層の設計**(WireGuard基本実装と同時開発、ユーザー
   指示2026-09-27): AmneziaWGの公開プロトコル仕様・設計思想(パケットの
   ヘッダー偽装・タイミング撹乱等でHTTPS風に見せる手法)をGoogle検索・
