@@ -88,6 +88,27 @@ eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.
 参考にRust + `open-web-server`/`RPoem`で一から実装する。詳細比較表は
 [`README.md`](README.md)「技術選定」を参照。
 
+## 8. 関連リポジトリとの連携方針(2026-09-27、構想段階)
+
+ユーザーから「VLESS+REALITYをopen-directx・open-cuda・aruaru-llm等の関連
+リポジトリも使って一緒に駆使してほしい」との指示があり、各リポジトリの
+役割を確認した上で以下の構想を決定した(詳細は[`README.md`](README.md)
+「関連リポジトリとの連携」参照)。
+
+- `aruaru-llm`: AIで通信パターンを動的調整し、検閲側のAIトラフィック
+  分類器による検知を回避しやすくする。
+- `open-cuda`: 暗号処理・`aruaru-llm`推論のGPU高速化。
+- `open-directx`: `open-cuda`と共通の計算基盤を共有しつつ、クライアント
+  管理UIの高速描画に使う。
+
+**現状の制約**: `open-cuda`はREADME.md/CLAUDE.md/PORTING.mdが未整備、
+`open-directx`はGitHub上に空リポジトリのみで実体が無い(いずれも
+`runo`のREADME.mdに記載済みの既知の状態)。よって連携実装は今すぐには
+着手できず、これらのリポジトリ側の成熟を待つ必要がある。VLESS+REALITY
+本体の実装(プロトコル部分)は連携なしでも進められるため、まずはプロトコル
+本体を単独で実装し、連携部分は各リポジトリの状況を見ながら段階的に
+組み込む方針とする。
+
 ## 次回再開ポイント
 
 - 上記2(実装言語・基盤)の詳細、`boringtun`のアーキテクチャ調査(コードは

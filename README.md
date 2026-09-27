@@ -96,6 +96,30 @@ Rust + `open-web-server`/`RPoem`で一から実装する(既存方針どおり)�
 - **鍵管理・利用者ごとのアクセス制御**: Outline VPNの「鍵ごとの帯域管理・
   失効の容易さ」を参考に設計する。
 
+## 関連リポジトリとの連携(2026-09-27方針、構想段階)
+
+VLESS+REALITY(および将来的にはWireGuard+AmneziaWGも)の「検閲側のAI検知に
+対抗する自然な通信」「高速・高セキュリティな暗号化」「クライアント管理UIの
+高速描画」を実現するため、以下のaon-co-jpエコシステム内リポジトリと連携する
+構想がある(いずれも各リポジトリ側が該当機能を提供できる段階になってから
+実際の連携実装に着手する、現時点では構想のみ)。
+
+- **[`aruaru-llm`](https://github.com/aon-co-jp/aruaru-llm)**: AIで通信
+  パターン(パケットサイズ・送信タイミング等)を動的に調整し、検閲側の
+  AIベースのトラフィック分類器による検知を回避しやすくする
+  (「不自然に規則的な通信」を避け、実際の一般的な通信により近づける)。
+- **[`open-cuda`](https://github.com/aon-co-jp/open-cuda)**: TLS/AES等の
+  暗号処理、および`aruaru-llm`の推論処理をGPUで高速化する。
+- **[`open-directx`](https://github.com/aon-co-jp/open-directx)**:
+  `open-cuda`と共通の計算基盤を共有しつつ、クライアント管理アプリ
+  (設定画面・通信統計表示等)のUIを高速描画する。DirectX互換の
+  クロスプラットフォーム抽象化層という位置づけ(構想段階、実装はまだ無い)。
+
+**現状の制約**: `open-cuda`・`open-directx`はいずれも標準構成の
+README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
+リポジトリのみ確認)、実体としての実装がまだ乏しい段階にある。連携実装は
+これらのリポジトリ側の成熟を待ってから着手する。
+
 ## 開発方針
 
 このリポジトリの開発ルールは[`open-raid-z`](https://github.com/aon-co-jp/open-raid-z)の

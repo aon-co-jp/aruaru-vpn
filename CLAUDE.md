@@ -54,6 +54,16 @@ OSSテンプレート。**aon-co-jpは中継サーバーを運営しない**(テ
   参照。決め打ちせず、実装着手時にGoogle検索・GitHub調査を経て決定する
   (`open-LiveKit`と同じ開発姿勢)。
 
+## 関連リポジトリとの連携(構想段階、2026-09-27)
+
+`aruaru-llm`(AIによる通信パターン擬態)・`open-cuda`(暗号処理/AI推論の
+GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-cudaと
+計算基盤共有)と連携する構想がある。ただし`open-cuda`/`open-directx`は
+現状README/CLAUDE.md/PORTING.mdが未整備・実体が乏しく、連携実装は
+これらの成熟を待つ。VLESS+REALITY本体の実装は連携なしで進める。詳細は
+[`README.md`](README.md)「関連リポジトリとの連携」、
+[`PORTING.md`](PORTING.md)「8. 関連リポジトリとの連携方針」を参照。
+
 ## HANDOFF
 
 - **2026-09-27 リポジトリ新設+プロトコル選定(2回改訂)**:
