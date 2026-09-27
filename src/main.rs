@@ -1,5 +1,6 @@
 mod amnezia;
 mod integration;
+mod net;
 mod reality;
 mod reality_auth;
 mod tls_clienthello;
