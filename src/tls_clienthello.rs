@@ -20,10 +20,15 @@
 pub struct ParsedClientHello {
     /// SNI拡張で示されたホスト名(例: "www.microsoft.com")。無ければ`None`。
     pub server_name: Option<String>,
-    /// session_idフィールド(0〜32バイト)。REALITYの認証情報(short_id)は
-    /// この末尾数バイトに埋め込まれる想定(実際のREALITY仕様に準拠する
-    /// 詳細な埋め込み方式は次フェーズで確定する)。
+    /// session_idフィールド(0〜32バイト)。REALITYの認証タグ
+    /// (`reality_auth::verify_auth_tag`)はこの中に埋め込まれる想定。
     pub session_id: Vec<u8>,
+    /// TLS 1.3 `key_share`拡張(extension type 0x0033)内の、X25519
+    /// (NamedGroup 0x001D)エントリの鍵交換値(32バイト)。REALITYの
+    /// X25519 ECDH認証(`reality_auth.rs`)に使うクライアントのエフェメラル
+    /// 公開鍵。無ければ`None`(X25519を提示しないクライアント、または
+    /// key_share拡張自体が無いクライアント)。
+    pub x25519_key_share: Option<[u8; 32]>,
 }
 
 /// パース失敗時のエラー。
@@ -37,6 +42,8 @@ pub enum ParseError {
 const TLS_HANDSHAKE_CONTENT_TYPE: u8 = 0x16;
 const TLS_HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const EXTENSION_TYPE_SERVER_NAME: u16 = 0x0000;
+const EXTENSION_TYPE_KEY_SHARE: u16 = 0x0033;
+const NAMED_GROUP_X25519: u16 = 0x001d;
 
 /// TLSレコード層(5バイトヘッダ)+ハンドシェイク層(4バイトヘッダ)を剥がし、
 /// `ClientHello`本体から`server_name`と`session_id`を抽出する。
@@ -106,34 +113,63 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ParsedClientHello, ParseError
         as usize;
     cursor += 1 + compression_len;
 
-    // extensions: 2バイト長 + 可変長本体(無ければserver_nameはNone)
-    let server_name = if cursor + 2 <= hs_body.len() {
+    // extensions: 2バイト長 + 可変長本体(無ければserver_name/key_shareはNone)
+    let (server_name, x25519_key_share) = if cursor + 2 <= hs_body.len() {
         let extensions_len = u16::from_be_bytes([hs_body[cursor], hs_body[cursor + 1]]) as usize;
         cursor += 2;
         let extensions_end = (cursor + extensions_len).min(hs_body.len());
-        parse_server_name_extension(&hs_body[cursor..extensions_end])
+        let extensions = &hs_body[cursor..extensions_end];
+        (
+            find_extension(extensions, EXTENSION_TYPE_SERVER_NAME).and_then(parse_server_name_list),
+            find_extension(extensions, EXTENSION_TYPE_KEY_SHARE).and_then(parse_key_share_x25519),
+        )
     } else {
-        None
+        (None, None)
     };
 
     Ok(ParsedClientHello {
         server_name,
         session_id,
+        x25519_key_share,
     })
 }
 
-/// 拡張リストの中からSNI拡張(type=0)を探し、ホスト名を取り出す。
-fn parse_server_name_extension(extensions: &[u8]) -> Option<String> {
+/// 拡張リストの中から指定した`extension_type`を探し、その拡張データ本体
+/// (`extension_data`)を返す。
+fn find_extension(extensions: &[u8], extension_type: u16) -> Option<&[u8]> {
     let mut cursor = 0usize;
     while cursor + 4 <= extensions.len() {
         let ext_type = u16::from_be_bytes([extensions[cursor], extensions[cursor + 1]]);
         let ext_len = u16::from_be_bytes([extensions[cursor + 2], extensions[cursor + 3]]) as usize;
         let ext_start = cursor + 4;
         let ext_end = (ext_start + ext_len).min(extensions.len());
-        if ext_type == EXTENSION_TYPE_SERVER_NAME {
-            return parse_server_name_list(&extensions[ext_start..ext_end]);
+        if ext_type == extension_type {
+            return Some(&extensions[ext_start..ext_end]);
         }
         cursor = ext_end;
+    }
+    None
+}
+
+/// `key_share`拡張(クライアント側、RFC 8446 4.2.8)の
+/// `client_shares`リストからX25519エントリを探し、32バイトの鍵交換値を
+/// 返す。
+fn parse_key_share_x25519(body: &[u8]) -> Option<[u8; 32]> {
+    if body.len() < 2 {
+        return None;
+    }
+    let mut cursor = 2usize; // client_shares全体の2バイト長は読み飛ばす
+    while cursor + 4 <= body.len() {
+        let group = u16::from_be_bytes([body[cursor], body[cursor + 1]]);
+        let ke_len = u16::from_be_bytes([body[cursor + 2], body[cursor + 3]]) as usize;
+        let ke_start = cursor + 4;
+        let ke_end = (ke_start + ke_len).min(body.len());
+        if group == NAMED_GROUP_X25519 && ke_end - ke_start == 32 {
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&body[ke_start..ke_end]);
+            return Some(key);
+        }
+        cursor = ke_end;
     }
     None
 }
@@ -166,6 +202,14 @@ pub(crate) mod tests_support {
     pub(crate) fn build_client_hello_for_tests(session_id: &[u8], sni: &str) -> Vec<u8> {
         super::tests::build_client_hello(session_id, sni)
     }
+
+    pub(crate) fn build_client_hello_with_key_share_for_tests(
+        session_id: &[u8],
+        sni: &str,
+        x25519_public: &[u8; 32],
+    ) -> Vec<u8> {
+        super::tests::build_client_hello_with_key_share(session_id, sni, Some(*x25519_public))
+    }
 }
 
 #[cfg(test)]
@@ -173,8 +217,17 @@ mod tests {
     use super::*;
 
     /// テスト用に、SNI("example.test")とsession_idを含む最小限の
-    /// ClientHelloバイト列を組み立てる。
+    /// ClientHelloバイト列を組み立てる(key_share拡張は無し)。
     pub(super) fn build_client_hello(session_id: &[u8], sni: &str) -> Vec<u8> {
+        build_client_hello_with_key_share(session_id, sni, None)
+    }
+
+    /// `build_client_hello`にX25519の`key_share`拡張を追加できる版。
+    pub(super) fn build_client_hello_with_key_share(
+        session_id: &[u8],
+        sni: &str,
+        x25519_public: Option<[u8; 32]>,
+    ) -> Vec<u8> {
         let mut hs_body = Vec::new();
         hs_body.extend_from_slice(&[0x03, 0x03]); // client_version (TLS 1.2 legacy)
         hs_body.extend_from_slice(&[0u8; 32]); // random
@@ -198,8 +251,33 @@ mod tests {
         sni_extension.extend_from_slice(&(server_name_list.len() as u16).to_be_bytes());
         sni_extension.extend_from_slice(&server_name_list);
 
-        hs_body.extend_from_slice(&(sni_extension.len() as u16).to_be_bytes());
-        hs_body.extend_from_slice(&sni_extension);
+        // すべての拡張(SNI・任意でkey_share)を1つのバッファにまとめてから、
+        // その合計長を「extensions」フィールドの長さとして書き出す
+        // (TLS ClientHelloは「1つの拡張の長さ」ではなく「拡張リスト全体の
+        // 長さ」を持つため)。
+        let mut all_extensions = Vec::new();
+        all_extensions.extend_from_slice(&sni_extension);
+
+        if let Some(pubkey) = x25519_public {
+            let mut key_share_entry = Vec::new();
+            key_share_entry.extend_from_slice(&NAMED_GROUP_X25519.to_be_bytes());
+            key_share_entry.extend_from_slice(&(pubkey.len() as u16).to_be_bytes());
+            key_share_entry.extend_from_slice(&pubkey);
+
+            let mut client_shares = Vec::new();
+            client_shares.extend_from_slice(&(key_share_entry.len() as u16).to_be_bytes());
+            client_shares.extend_from_slice(&key_share_entry);
+
+            let mut key_share_extension = Vec::new();
+            key_share_extension.extend_from_slice(&EXTENSION_TYPE_KEY_SHARE.to_be_bytes());
+            key_share_extension.extend_from_slice(&(client_shares.len() as u16).to_be_bytes());
+            key_share_extension.extend_from_slice(&client_shares);
+
+            all_extensions.extend_from_slice(&key_share_extension);
+        }
+
+        hs_body.extend_from_slice(&(all_extensions.len() as u16).to_be_bytes());
+        hs_body.extend_from_slice(&all_extensions);
 
         let mut handshake = Vec::new();
         handshake.push(TLS_HANDSHAKE_TYPE_CLIENT_HELLO);
@@ -221,6 +299,23 @@ mod tests {
         let parsed = parse_client_hello(&record).expect("valid ClientHello must parse");
         assert_eq!(parsed.server_name.as_deref(), Some("www.microsoft.com"));
         assert_eq!(parsed.session_id, b"example-short-id".to_vec());
+        assert_eq!(parsed.x25519_key_share, None);
+    }
+
+    #[test]
+    fn parses_x25519_key_share_when_present() {
+        let pubkey = [7u8; 32];
+        let record = build_client_hello_with_key_share(b"sid", "example.test", Some(pubkey));
+        let parsed = parse_client_hello(&record).expect("valid ClientHello must parse");
+        assert_eq!(parsed.server_name.as_deref(), Some("example.test"));
+        assert_eq!(parsed.x25519_key_share, Some(pubkey));
+    }
+
+    #[test]
+    fn key_share_absent_when_client_omits_it() {
+        let record = build_client_hello(b"sid", "example.test");
+        let parsed = parse_client_hello(&record).expect("valid ClientHello must parse");
+        assert_eq!(parsed.x25519_key_share, None);
     }
 
     #[test]

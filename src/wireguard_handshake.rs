@@ -16,9 +16,16 @@
 use snow::{Builder, HandshakeState, TransportState};
 
 /// WireGuardが使うNoiseパターン(`Noise_IK_25519_ChaChaPoly_BLAKE2s`)。
-/// PSK(事前共有鍵)を使う`IKpsk2`変種は`snow`のpsk APIで次フェーズに
-/// 追加する(まずはPSK無しの`IK`で疎通確認する)。
 const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
+
+/// WireGuard本来の`Noise_IKpsk2`(事前共有鍵付き)のパターン。PSKは
+/// 「量子コンピュータが将来X25519を破っても、事前に安全な経路で配布した
+/// 対称鍵を知らない限り復元できない」という耐量子性の底上げのために
+/// WireGuardが標準で採用している(公開仕様のみ参考)。
+const NOISE_PARAMS_PSK2: &str = "Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s";
+
+/// PSK(事前共有鍵)のバイト長(Noiseプロトコル仕様上32バイト固定)。
+pub const PSK_LEN: usize = 32;
 
 /// ハンドシェイク前(鍵生成のみ)の当事者。
 pub struct Peer {
@@ -56,6 +63,31 @@ pub fn build_initiator(
 pub fn build_responder(local: &Peer) -> Result<HandshakeState, snow::Error> {
     Builder::new(NOISE_PARAMS.parse().unwrap())
         .local_private_key(&local.private_key)?
+        .build_responder()
+}
+
+/// PSK(事前共有鍵)付きのイニシエーター(`Noise_IKpsk2`)を組み立てる。
+/// `psk`は両当事者が安全な経路で事前共有した32バイトの対称鍵。
+pub fn build_initiator_with_psk(
+    local: &Peer,
+    remote_public_key: &[u8],
+    psk: &[u8; PSK_LEN],
+) -> Result<HandshakeState, snow::Error> {
+    Builder::new(NOISE_PARAMS_PSK2.parse().unwrap())
+        .local_private_key(&local.private_key)?
+        .remote_public_key(remote_public_key)?
+        .psk(2, psk)?
+        .build_initiator()
+}
+
+/// PSK(事前共有鍵)付きのレスポンダー(`Noise_IKpsk2`)を組み立てる。
+pub fn build_responder_with_psk(
+    local: &Peer,
+    psk: &[u8; PSK_LEN],
+) -> Result<HandshakeState, snow::Error> {
+    Builder::new(NOISE_PARAMS_PSK2.parse().unwrap())
+        .local_private_key(&local.private_key)?
+        .psk(2, psk)?
         .build_responder()
 }
 
@@ -139,5 +171,71 @@ mod tests {
              (short_id/REALITY auth) is required for that, matching relay.rs's design"
         );
         let _ = real_initiator_peer; // 未使用警告避け(ドキュメント目的で保持)
+    }
+
+    #[test]
+    fn psk_handshake_completes_when_both_sides_share_the_same_psk() {
+        let initiator_peer = Peer::generate().unwrap();
+        let responder_peer = Peer::generate().unwrap();
+        let psk = [42u8; PSK_LEN];
+
+        let initiator =
+            build_initiator_with_psk(&initiator_peer, &responder_peer.public_key, &psk).unwrap();
+        let responder = build_responder_with_psk(&responder_peer, &psk).unwrap();
+
+        let (mut initiator_transport, mut responder_transport) =
+            perform_handshake(initiator, responder).expect("PSK handshake must complete");
+
+        let plaintext = b"psk-protected message";
+        let mut ciphertext = [0u8; 1024];
+        let ct_len = initiator_transport
+            .write_message(plaintext, &mut ciphertext)
+            .unwrap();
+        let mut decrypted = [0u8; 1024];
+        let pt_len = responder_transport
+            .read_message(&ciphertext[..ct_len], &mut decrypted)
+            .expect("responder must decrypt with the matching PSK");
+        assert_eq!(&decrypted[..pt_len], plaintext);
+    }
+
+    #[test]
+    fn psk_mismatch_breaks_transport_decryption() {
+        let initiator_peer = Peer::generate().unwrap();
+        let responder_peer = Peer::generate().unwrap();
+        let initiator_psk = [1u8; PSK_LEN];
+        let responder_psk = [2u8; PSK_LEN]; // 意図的に異なるPSKを使わせる
+
+        let initiator = build_initiator_with_psk(
+            &initiator_peer,
+            &responder_peer.public_key,
+            &initiator_psk,
+        )
+        .unwrap();
+        let responder = build_responder_with_psk(&responder_peer, &responder_psk).unwrap();
+
+        // ハンドシェイク自体のメッセージ交換はPSKが違っても形の上では
+        // 進む(Noiseのハンドシェイクメッセージ自体はPSKの正誤を即座には
+        // 検証しない実装もあるため)が、導出される鍵が食い違うので、
+        // その後の実データの暗号化/復号が必ず失敗する。これによって
+        // 「PSKが一致しない限り通信が成立しない」ことを確認する。
+        let handshake_result = perform_handshake(initiator, responder);
+
+        match handshake_result {
+            Err(_) => { /* ハンドシェイク自体で検出できた場合もOK */ }
+            Ok((mut initiator_transport, mut responder_transport)) => {
+                let plaintext = b"this must not be readable by the responder";
+                let mut ciphertext = [0u8; 1024];
+                let ct_len = initiator_transport
+                    .write_message(plaintext, &mut ciphertext)
+                    .unwrap();
+                let mut decrypted = [0u8; 1024];
+                let decrypt_result =
+                    responder_transport.read_message(&ciphertext[..ct_len], &mut decrypted);
+                assert!(
+                    decrypt_result.is_err(),
+                    "decryption must fail when the PSKs differ"
+                );
+            }
+        }
     }
 }

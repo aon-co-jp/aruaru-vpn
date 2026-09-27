@@ -182,16 +182,39 @@ eBPF/XDPカーネル最適化版もあり。他に[rust-reality](https://github.
   **未統合**: `amnezia.rs`のジャンクパケット送信計画との組み合わせ、
   PSK(事前共有鍵、`Noise_IKpsk2`)の追加は次フェーズ。
 
+## 12. 実装フェーズ4(完了・2026-09-27): 次フェーズ3項目を統合
+
+ユーザー指示「未統合の3項目(key_share抽出、AmneziaWG+WireGuard統合、
+PSK追加)を次フェーズとして統合して」を受け実装。`cargo test`で36テスト
+全通過(既存26+新規10)。
+
+1. **key_share拡張のパース+REALITY認証のTLS層統合**:
+   [`src/tls_clienthello.rs`](src/tls_clienthello.rs)にTLS 1.3
+   `key_share`拡張(extension type 0x0033)のパースを追加し、X25519
+   (NamedGroup 0x001d)エントリの32バイト鍵交換値を抽出できるようにした。
+   [`src/reality.rs`](src/reality.rs)に`decide_from_client_hello_record_x25519`
+   を追加し、抽出した公開鍵+`session_id`(認証タグ)を
+   `reality_auth::verify_auth_tag`で検証する本格版の判定フローを実装
+   (`key_share`が無いクライアントは常にFallbackとする設計)。
+2. **WireGuard+AmneziaWGの統合**: [`src/amnezia.rs`](src/amnezia.rs)に
+   `build_obfuscated_send_sequence`(送信計画に沿ってジャンク+実メッセージの
+   バイト列を組み立てる)と`extract_real_handshake_message`(送受信で
+   事前共有した`junk_packet_count`を使い、パケット内容を解析せず単純に
+   位置で本物を取り出す、実際のAmneziaWGと同じ設計)を追加。実際に
+   `wireguard_handshake`が生成したハンドシェイクメッセージをジャンクに
+   埋もれさせ、レスポンダー側で正しく取り出して処理できることをend-to-end
+   テストで確認。
+3. **PSK(`Noise_IKpsk2`)の追加**: [`src/wireguard_handshake.rs`](src/wireguard_handshake.rs)
+   に`build_initiator_with_psk`/`build_responder_with_psk`を追加。両者が
+   同じPSKを使えばハンドシェイク・データ通信とも成功し、PSKが食い違うと
+   (ハンドシェイク自体は形の上で進んでも)実データの復号が必ず失敗する
+   ことをテストで確認。
+
 ## 次回再開ポイント
 
-- **REALITY認証のTLS層統合**: `tls_clienthello.rs`に`key_share`拡張の
-  パースを追加し、`reality_auth.rs`の検証を実際のTLSハンドシェイクへ
-  組み込む。
-- **WireGuard+AmneziaWGの統合**: `wireguard_handshake.rs`のメッセージ送信を
-  `amnezia.rs`の送信計画(ジャンクパケット→実メッセージ)でラップする。
-- **PSK(Noise_IKpsk2)の追加**: WireGuard本来の事前共有鍵によるさらなる
-  耐量子性の考慮。
 - 上記3(配布形態)・4(鍵管理)の検討。
 - 透明性告知文の残り約100言語への翻訳拡張、ネイティブ検証の依頼。
 - 実際のWebアプリ/クライアントUIへの「目立つ場所へのリンク設置」実装
   (実装フェーズ未着手のため、クライアント実装と合わせて行う)。
+- 実ネットワークI/O(TCP/UDPソケット)への統合(現状はすべてメモリ上の
+  バイト列でのテストのみ)。

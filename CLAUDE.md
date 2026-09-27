@@ -80,6 +80,14 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-27 実装フェーズ4完了**: 未統合だった3項目を統合。(1)
+  `tls_clienthello.rs`に`key_share`拡張パースを追加し
+  `reality::decide_from_client_hello_record_x25519`でTLS層とX25519認証を
+  接続、(2)`amnezia.rs`に`build_obfuscated_send_sequence`/
+  `extract_real_handshake_message`を追加しWireGuardハンドシェイク
+  メッセージをジャンクパケットに埋め込むend-to-end統合、(3)
+  `wireguard_handshake.rs`にPSK(`Noise_IKpsk2`)対応を追加。`cargo test`で
+  36テスト全通過。次は実ネットワークI/O統合・配布形態/鍵管理の検討。
 - **2026-09-27 実装フェーズ3完了**: [`src/reality_auth.rs`](src/reality_auth.rs)
   にX25519 ECDH+HKDFによるREALITY本来の認証タグ検証(暗号プリミティブは
   x25519-dalek/hkdf crateに委ねる)、[`src/wireguard_handshake.rs`](src/wireguard_handshake.rs)

@@ -104,6 +104,40 @@ pub fn decide_from_client_hello_record(
     ))
 }
 
+/// [`decide_from_client_hello_record`]の本格版: `session_id`の単純比較
+/// ではなく、TLS 1.3 `key_share`拡張から取り出したクライアントのX25519
+/// エフェメラル公開鍵と、`session_id`に埋め込まれた認証タグを
+/// [`crate::reality_auth::verify_auth_tag`](X25519 ECDH + HKDF)で検証する。
+///
+/// `key_share`拡張が無いクライアント(X25519を提示しない、または
+/// TLS 1.3以前のクライアント)は認証不能とみなし、常に`Fallback`とする
+/// (REALITYはTLS 1.3のクライアントのみを相手にする設計のため)。
+pub fn decide_from_client_hello_record_x25519(
+    identity: &crate::reality_auth::ServerIdentity,
+    record: &[u8],
+    default_camouflage_target: &str,
+) -> Result<ConnectionAction, crate::tls_clienthello::ParseError> {
+    let parsed = crate::tls_clienthello::parse_client_hello(record)?;
+    let camouflage_target = parsed
+        .server_name
+        .clone()
+        .unwrap_or_else(|| default_camouflage_target.to_owned());
+
+    let authenticated = match parsed.x25519_key_share {
+        Some(raw_key) => {
+            let client_public = x25519_dalek::PublicKey::from(raw_key);
+            crate::reality_auth::verify_auth_tag(identity, &client_public, &parsed.session_id)
+        }
+        None => false,
+    };
+
+    Ok(if authenticated {
+        ConnectionAction::Relay
+    } else {
+        ConnectionAction::Fallback { camouflage_target }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +198,76 @@ mod tests {
         let record = build_client_hello_for_tests(b"wrong-id", "www.microsoft.com");
         let action =
             decide_from_client_hello_record(&checker, &record, "fallback.example").unwrap();
+        assert_eq!(
+            action,
+            ConnectionAction::Fallback {
+                camouflage_target: "www.microsoft.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn x25519_variant_relays_for_genuine_client() {
+        use crate::reality_auth::{ClientEphemeralKeypair, ServerIdentity};
+        use crate::tls_clienthello::tests_support::build_client_hello_with_key_share_for_tests;
+
+        let identity = ServerIdentity::generate([1u8; 32]);
+        let client = ClientEphemeralKeypair::generate([2u8; 32]);
+        let tag = client.derive_auth_tag(&identity.public_key());
+
+        let record = build_client_hello_with_key_share_for_tests(
+            &tag,
+            "www.microsoft.com",
+            &client.public_key().to_bytes(),
+        );
+
+        let action =
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
+                .unwrap();
+        assert_eq!(action, ConnectionAction::Relay);
+    }
+
+    #[test]
+    fn x25519_variant_falls_back_for_impersonator() {
+        use crate::reality_auth::{ClientEphemeralKeypair, ServerIdentity};
+        use crate::tls_clienthello::tests_support::build_client_hello_with_key_share_for_tests;
+
+        let identity = ServerIdentity::generate([1u8; 32]);
+        let real_client = ClientEphemeralKeypair::generate([2u8; 32]);
+        let impersonator = ClientEphemeralKeypair::generate([3u8; 32]);
+
+        // 攻撃者は自分の鍵から計算したタグを提示するが、公開鍵の欄には
+        // (盗聴して知った)正規クライアントの公開鍵を書く、という
+        // なりすましを試みるシナリオ。
+        let forged_tag = impersonator.derive_auth_tag(&identity.public_key());
+        let record = build_client_hello_with_key_share_for_tests(
+            &forged_tag,
+            "www.microsoft.com",
+            &real_client.public_key().to_bytes(),
+        );
+
+        let action =
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
+                .unwrap();
+        assert_eq!(
+            action,
+            ConnectionAction::Fallback {
+                camouflage_target: "www.microsoft.com".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn x25519_variant_falls_back_when_key_share_missing() {
+        use crate::reality_auth::ServerIdentity;
+        use crate::tls_clienthello::tests_support::build_client_hello_for_tests;
+
+        let identity = ServerIdentity::generate([1u8; 32]);
+        let record = build_client_hello_for_tests(b"whatever", "www.microsoft.com");
+
+        let action =
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
+                .unwrap();
         assert_eq!(
             action,
             ConnectionAction::Fallback {
