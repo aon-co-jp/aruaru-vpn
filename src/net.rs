@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::reality::{decide_from_client_hello_record_x25519, ConnectionAction};
 use crate::reality_auth::ServerIdentity;
+use crate::vless::{self, Address, VlessRequest};
 
 /// TCP接続を1本受け付け、その最初のTLS ClientHelloレコードを読み取って
 /// REALITY判定を行い、
@@ -64,6 +65,56 @@ where
             Ok(None)
         }
     }
+}
+
+/// `accept_and_route`が`Relay`と判定して返した`TcpStream`から、実際に
+/// VLESSリクエストヘッダを読み取り、指定された宛先へ実際に接続して
+/// 中継する(実装フェーズ7: VLESSプロトコル本体の統合)。
+///
+/// **重要な簡略化**: 本来のREALITYは、この時点でTLSハンドシェイクが完了し
+/// 暗号化された通信路の中をVLESSリクエストが流れる。この最小プロトタイプは
+/// TLS終端(実際の暗号化/復号)をまだ実装していないため、`client_stream`に
+/// 平文で届くバイト列をそのままVLESSリクエストとして解釈する
+/// (`open-LiveKit`の実装と同様、「核心のロジックが動く」ことを先に確認し、
+/// 実TLS終端は次フェーズで統合する)。
+///
+/// `dial_destination`は「宛先(IP/ドメイン+ポート)を受け取り、そこへの
+/// TCP接続を返す」関数。実運用では実際のインターネット上の宛先へ接続するが、
+/// テストではローカルのモックサーバーを使えるよう抽象化してある。
+pub async fn handle_relay_session<F, Fut>(
+    mut client_stream: TcpStream,
+    dial_destination: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(Address, u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    let mut buf = vec![0u8; 4096];
+    let n = client_stream.read(&mut buf).await?;
+    let data = &buf[..n];
+
+    let VlessRequest {
+        version,
+        address,
+        port,
+        header_len,
+        ..
+    } = vless::parse_request(data).map_err(|e| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+    })?;
+
+    let mut destination_stream = dial_destination(address, port).await?;
+
+    // サーバー応答ヘッダを先にクライアントへ返してから、リクエストヘッダに
+    // 続いていた実データ(あれば)を宛先へ転送し、以降は双方向に中継する。
+    client_stream
+        .write_all(&vless::build_response_header(version))
+        .await?;
+    if header_len < data.len() {
+        destination_stream.write_all(&data[header_len..]).await?;
+    }
+    tokio::io::copy_bidirectional(&mut client_stream, &mut destination_stream).await?;
+    Ok(())
 }
 
 /// 実際のUDPソケット越しにWireGuard相当のNoiseハンドシェイクを行う。
@@ -190,6 +241,76 @@ mod tests {
 
         let result = server_task.await.unwrap().unwrap();
         assert!(result.is_some(), "authenticated client must be handed back for Relay handling");
+    }
+
+    /// REALITY認証を通過した接続が、実際にVLESSリクエストヘッダで指定した
+    /// 宛先(モックのTCPサーバー)へ中継され、往復でデータが届くことを
+    /// end-to-endで確認する。
+    #[tokio::test]
+    async fn relay_session_forwards_to_the_requested_vless_destination() {
+        // VLESSリクエストが指す「宛先」役のモックサーバー(echo)。
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = destination_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+                let mut discard = [0u8; 1];
+                let _ = stream.read(&mut discard).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        // REALITY認証を通過した後の「クライアント⇔サーバー」区間を模擬する
+        // 2つのTCP接続(client_side/server_sideは同じソケットペアの両端)。
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+
+        let destination_port = destination_addr.port();
+        let server_task = tokio::spawn(async move {
+            let (server_side_stream, _) = relay_listener.accept().await.unwrap();
+            handle_relay_session(server_side_stream, |address, port| async move {
+                assert_eq!(port, destination_port);
+                match address {
+                    Address::Domain(d) if d == "127.0.0.1" => {
+                        TcpStream::connect(("127.0.0.1", port)).await
+                    }
+                    other => panic!("unexpected destination address in test: {other:?}"),
+                }
+            })
+            .await
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8); // version
+        vless_request.extend_from_slice(&[0u8; 16]); // uuid (未検証、次フェーズ)
+        vless_request.push(0u8); // addons_len = 0
+        vless_request.push(1u8); // command = TCP
+        vless_request.extend_from_slice(&destination_port.to_be_bytes());
+        let domain = b"127.0.0.1";
+        vless_request.push(2u8); // address_type = domain
+        vless_request.push(domain.len() as u8);
+        vless_request.extend_from_slice(domain);
+        vless_request.extend_from_slice(b"payload-through-vless");
+
+        client.write_all(&vless_request).await.unwrap();
+
+        // サーバー応答ヘッダ([version][addons_len=0])を確認。
+        let mut response_header = [0u8; 2];
+        client.read_exact(&mut response_header).await.unwrap();
+        assert_eq!(response_header, [0u8, 0u8]);
+
+        // ペイロードが宛先(モックecho)まで届いて折り返されてくることを確認。
+        let mut echoed = vec![0u8; b"payload-through-vless".len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"payload-through-vless");
+
+        client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
     }
 
     /// WireGuard相当のNoiseハンドシェイクを、実際のUDPソケット越しに行い、

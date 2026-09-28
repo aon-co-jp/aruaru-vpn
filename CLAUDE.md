@@ -95,6 +95,15 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-28 実装フェーズ6・7完了**: [`src/key_storage.rs`](src/key_storage.rs)
+  で秘密鍵/公開鍵の保存先ドライブ/ディレクトリを利用者が任意に選択できる
+  ようにした(`KeyStorageConfig`)。「保存先を平文メモに自動記録する」機能は
+  一度実装したがセキュリティ上の懸念(鍵ファイルの場所の手がかりを与える)
+  でユーザー指摘により撤回・削除済み。続けて[`src/vless.rs`](src/vless.rs)
+  にVLESSリクエストヘッダのパーサーを実装し、`net.rs`の`handle_relay_session`
+  でREALITY認証通過後の接続が実際にVLESSの指定する宛先へ中継されることを
+  end-to-endで確認。`cargo test`で53テスト全通過。UUID検証・UDP/MUX対応・
+  実TLS終端との統合は未着手。
 - **2026-09-28 実装フェーズ5完了+鍵管理方針決定**: [`src/net.rs`](src/net.rs)
   で全モジュールを実際のTCP/UDPソケットに統合。`accept_and_route`で
   REALITY判定→認証失敗時は実TCP接続で偽装先へ双方向中継、

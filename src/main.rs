@@ -5,6 +5,7 @@ mod net;
 mod reality;
 mod reality_auth;
 mod tls_clienthello;
+mod vless;
 mod wireguard_handshake;
 
 use amnezia::{plan_handshake_send_sequence, ObfuscationConfig};
