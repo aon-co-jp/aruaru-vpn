@@ -95,6 +95,14 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-28 実装フェーズ9完了(実TLS終端の試作品)**: [`src/tls_terminate.rs`](src/tls_terminate.rs)
+  で`rustls`/`tokio-rustls`を使い、自己署名証明書(`rcgen`で動的生成)に
+  よる実際のTLSハンドシェイク完了を実装。`PrefixedStream`で
+  「既に読み取り済みのClientHello先頭バイトを巻き戻す」仕組みを作り、
+  `accept_and_route`のような「最初に覗き見てから処理を続ける」設計と
+  実TLSハンドシェイクが両立することを確認。ユーザーとの合意により、
+  証明書クローン(偽装先サイトの本物証明書の流用)は次フェーズ、まずは
+  自己署名証明書からスタート。`cargo test`で59テスト全通過。
 - **2026-09-28 実装フェーズ8完了**: [`src/vless.rs`](src/vless.rs)に
   `AllowedUuids`/`validate_uuid`を追加し、VLESS自身のUUIDによる二段構え
   認証(輸送路のREALITY/TLSとは別)を実装。`net.rs`の

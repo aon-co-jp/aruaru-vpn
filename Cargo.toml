@@ -7,7 +7,10 @@ edition = "2024"
 hkdf = "0.13.0"
 rand = "0.10.3"
 rand_core = "0.10.1"
+rcgen = "0.14.10"
+rustls = "0.23.45"
 sha2 = "0.11.0"
 snow = "0.10.0"
 tokio = { version = "1.53.1", features = ["net", "io-util", "rt-multi-thread", "macros", "sync", "time"] }
+tokio-rustls = "0.26.5"
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }

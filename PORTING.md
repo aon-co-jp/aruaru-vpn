@@ -338,3 +338,30 @@ PSK追加)を次フェーズとして統合して」を受け実装。`cargo tes
 
 **未実施(次フェーズ)**: MUXコマンドの実処理、UDP複数データグラムの
 フレーミング、実TLS終端。
+
+## 19. 実装フェーズ9(試作品完成・2026-09-28): 実TLS終端(自己署名証明書)
+
+ユーザーとの合意通り、「証明書のクローン(偽装先サイトの証明書をそのまま
+流用)」という本格実装はいったん置き、**自己署名証明書での実TLS終端**の
+試作品からスタートした。`cargo test`で59テスト全通過(既存58+新規1)。
+
+- [`src/tls_terminate.rs`](src/tls_terminate.rs): [rustls](https://crates.io/crates/rustls)/
+  [tokio-rustls](https://crates.io/crates/tokio-rustls)(監査済み)を使い、
+  実際にTLSハンドシェイクを完了させる仕組みを実装。
+  - `generate_self_signed_cert`: [rcgen](https://crates.io/crates/rcgen)で
+    その場で自己署名証明書+秘密鍵を生成(開発・テスト用、実運用では固定
+    ファイルを読み込む形に置き換える)。
+  - `PrefixedStream<S>`: `accept_and_route`が最初の読み取りで既に消費して
+    しまったClientHelloの先頭バイト列を「巻き戻す」ためのAsyncRead/
+    AsyncWriteラッパー。まず`prefix`の残りを返し、使い切ったら実ソケット
+    からの読み取りに切り替える。
+  - `terminate_tls_with_prefix`: 上記`PrefixedStream`を使い、実際に
+    `TlsAcceptor`でTLSサーバーハンドシェイクを完了させる。
+  - end-to-endテストで、サーバー側が数バイトを先読みして消費した後でも
+    TLSハンドシェイクが最後まで完了し、暗号化されたアプリケーション
+    データ(実際のTLSレコードとして暗号化・復号)を送受信できることを確認。
+
+**残る制約(次フェーズ)**: 証明書は自己署名であり、REALITY本来の
+「偽装先サイトの本物の証明書をそのまま使う」偽装(証明書クローン)は
+未実装。`accept_and_route`/`handle_relay_session`との実際の配線(今は
+独立したモジュールとして動作確認しただけ)も未着手。
