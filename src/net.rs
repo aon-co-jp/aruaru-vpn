@@ -13,8 +13,8 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-use crate::reality::{decide_from_client_hello_record_x25519, ConnectionAction};
-use crate::reality_auth::ServerIdentity;
+use crate::reality_auth::{ChannelKeys, ServerIdentity};
+use crate::secure_channel;
 use crate::vless::{self, Address, AllowedUuids, Command, VlessRequest};
 
 /// TCP接続を1本受け付け、その最初のTLS ClientHelloレコードを読み取って
@@ -28,42 +28,92 @@ use crate::vless::{self, Address, AllowedUuids, Command, VlessRequest};
 /// `dial_camouflage`は「偽装先ホスト名を受け取り、そこへのTCP接続を返す」
 /// 関数。実運用では実際のインターネット上のサイトへ接続するが、テストでは
 /// ローカルのモックサーバーを使えるよう抽象化してある。
+/// TCPストリームからTLSレコードを**ちょうど1つ分だけ**読み取る。
+///
+/// レコードヘッダ(5バイト: `content_type`+`legacy_version`+`length`)を
+/// まず読み、そこに書かれた長さぶんだけ本体を読む。「まとめて4096バイト
+/// 読む」実装だと、クライアントがこのレコードの直後に別プロトコル層の
+/// データを続けて送ってきた場合、その分まで読み込んで捨ててしまう
+/// (実際にこのバグを踏んで`secure_channel`側がデッドロックした、
+/// `accept_and_route`のコメント参照)。
+async fn read_exactly_one_tls_record(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    let mut header = [0u8; 5];
+    stream.read_exact(&mut header).await?;
+    let body_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+
+    let mut record = Vec::with_capacity(5 + body_len);
+    record.extend_from_slice(&header);
+    record.resize(5 + body_len, 0);
+    stream.read_exact(&mut record[5..]).await?;
+    Ok(record)
+}
+
+/// [`accept_and_route`]が`Relay`と判定した場合に返す、以降のVLESS
+/// セッション処理に必要な材料一式。
+pub struct AuthenticatedConnection {
+    pub stream: TcpStream,
+    /// このクライアントとのX25519 ECDHから導出した`ChannelKeys`
+    /// ([`crate::secure_channel`]で暗号化通信路を組み立てるのに使う)。
+    pub channel_keys: ChannelKeys,
+}
+
 pub async fn accept_and_route<F, Fut>(
     listener: &TcpListener,
     identity: Arc<ServerIdentity>,
     dial_camouflage: F,
-) -> std::io::Result<Option<TcpStream>>
+) -> std::io::Result<Option<AuthenticatedConnection>>
 where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
 {
     let (mut client_stream, _peer_addr) = listener.accept().await?;
 
-    // TLSレコードは可変長。ここでは「最初の読み取りで1つの完全な
-    // ClientHelloレコードが届く」という簡略化した前提を置く(TCPの
-    // 断片化・複数レコードへの分割は次フェーズで扱う)。
-    let mut buf = vec![0u8; 4096];
-    let n = client_stream.read(&mut buf).await?;
-    let record = &buf[..n];
+    // **重要なバグ修正(実装フェーズ10で発覚)**: 以前はここで
+    // 「最大4096バイトを1回読み取る」実装になっていたが、クライアントが
+    // ClientHelloの直後に続けてsecure_channelのフレームを送ってくると、
+    // TCPがそれらを1回の読み取りにまとめてしまい、ClientHelloを超えた分
+    // (次のプロトコル層のバイト列)を読み捨ててしまう欠陥があった
+    // (`secure_channel`側が「新しいバイトが来るのを待ち続ける」デッド
+    // ロックとして顕在化した)。TLSレコードヘッダの5バイト
+    // (`type`+`version`+`length`)から実際の長さを読み取り、**ちょうど
+    // 1レコード分だけ**を読む。
+    let record = read_exactly_one_tls_record(&mut client_stream).await?;
 
-    let action = decide_from_client_hello_record_x25519(&identity, record, "www.microsoft.com")
-        .unwrap_or(ConnectionAction::Fallback {
-            camouflage_target: "www.microsoft.com".to_owned(),
-        });
+    // `decide_from_client_hello_record_x25519`と同じ判定を行うが、
+    // Relay確定時に`ChannelKeys`も導出できるよう、ここではClientHelloを
+    // 自前でパースしてクライアントのX25519公開鍵を保持しておく。
+    let parsed = crate::tls_clienthello::parse_client_hello(&record).ok();
+    let client_public_key = parsed
+        .as_ref()
+        .and_then(|p| p.x25519_key_share)
+        .map(x25519_dalek::PublicKey::from);
+    let session_id = parsed.as_ref().map(|p| p.session_id.clone()).unwrap_or_default();
+    let sni = parsed.as_ref().and_then(|p| p.server_name.clone());
 
-    match action {
-        ConnectionAction::Relay => Ok(Some(client_stream)),
-        ConnectionAction::Fallback { camouflage_target } => {
-            let mut camouflage_stream = dial_camouflage(camouflage_target).await?;
+    let authenticated = client_public_key
+        .as_ref()
+        .map(|pk| crate::reality_auth::verify_auth_tag(&identity, pk, &session_id))
+        .unwrap_or(false);
 
-            // クライアントが最初に送ってきたバイト(ClientHello自体)を
-            // まず偽装先へそのまま転送してから、以降は双方向に中継する
-            // (偽装先から見て「普通のTLSクライアントが接続してきた」という
-            // 状態を再現するため)。
-            camouflage_stream.write_all(record).await?;
-            tokio::io::copy_bidirectional(&mut client_stream, &mut camouflage_stream).await?;
-            Ok(None)
-        }
+    if authenticated {
+        // unwrapは安全: `authenticated`がtrueになるのは`client_public_key`が
+        // `Some`のときだけ(上の`map`参照)。
+        let channel_keys = identity.derive_channel_keys(client_public_key.as_ref().unwrap());
+        Ok(Some(AuthenticatedConnection {
+            stream: client_stream,
+            channel_keys,
+        }))
+    } else {
+        let camouflage_target = sni.unwrap_or_else(|| "www.microsoft.com".to_owned());
+        let mut camouflage_stream = dial_camouflage(camouflage_target).await?;
+
+        // クライアントが最初に送ってきたバイト(ClientHello自体)を
+        // まず偽装先へそのまま転送してから、以降は双方向に中継する
+        // (偽装先から見て「普通のTLSクライアントが接続してきた」という
+        // 状態を再現するため)。
+        camouflage_stream.write_all(&record).await?;
+        tokio::io::copy_bidirectional(&mut client_stream, &mut camouflage_stream).await?;
+        Ok(None)
     }
 }
 
@@ -145,6 +195,86 @@ where
             "MUX command is not implemented yet",
         )),
     }
+}
+
+/// [`handle_relay_session`]の暗号化版(実装フェーズ10): REALITY認証で
+/// 確立済みの`ChannelKeys`を使い、[`secure_channel`]で実際に暗号化された
+/// 通信路の中でVLESSセッションを処理する。
+///
+/// `client_stream`は生のTCP接続そのもの(TLSではなく、`secure_channel`の
+/// 独自AEADフレーミングで暗号化する、`tls_terminate.rs`のドキュメント
+/// 参照)。クライアントは最初の1メッセージとして「VLESSリクエストヘッダ+
+/// (あれば)先頭ペイロード」をまとめて送ってくる前提。
+///
+/// **現時点のスコープ**: `Command::Tcp`のみ対応(`Udp`/`Mux`は次フェーズ)。
+pub async fn handle_relay_session_secure<F, Fut>(
+    client_stream: TcpStream,
+    channel_keys: &ChannelKeys,
+    allowed_uuids: &AllowedUuids,
+    dial_destination: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(Address, u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    let (mut writer, mut reader) = secure_channel::responder_channel(client_stream, channel_keys);
+
+    let first_message = reader.recv().await?;
+    let request = vless::parse_request(&first_message)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+
+    if !vless::validate_uuid(&request, allowed_uuids) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "VLESS request presented an unregistered UUID",
+        ));
+    }
+
+    let VlessRequest {
+        version,
+        command,
+        address,
+        port,
+        header_len,
+        ..
+    } = request;
+
+    if command != Command::Tcp {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "only Command::Tcp is implemented over the encrypted secure_channel so far",
+        ));
+    }
+
+    let leftover_payload = &first_message[header_len..];
+    let mut destination_stream = dial_destination(address, port).await?;
+    if !leftover_payload.is_empty() {
+        destination_stream.write_all(leftover_payload).await?;
+    }
+    writer.send(&vless::build_response_header(version)).await?;
+
+    // secure_channelは「暗号化フレーム単位」、destination_streamは
+    // 「生のバイトストリーム」なので、`copy_bidirectional`は使えない。
+    // 双方向を手動でポンピングする最小限のループ。
+    let mut dest_buf = vec![0u8; 8192];
+    loop {
+        tokio::select! {
+            from_client = reader.recv() => {
+                match from_client {
+                    Ok(plaintext) => destination_stream.write_all(&plaintext).await?,
+                    Err(_) => break, // クライアント側の終了(EOF/エラー)とみなす
+                }
+            }
+            from_dest = destination_stream.read(&mut dest_buf) => {
+                let n = from_dest?;
+                if n == 0 {
+                    break; // 宛先側がクローズ
+                }
+                writer.send(&dest_buf[..n]).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// VLESS `Command::Udp`の最小実装: 実際のUDPソケットで宛先とやり取りする。
@@ -466,6 +596,101 @@ mod tests {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, b"udp-payload");
 
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// フルパイプラインのend-to-endテスト(実装フェーズ10): 実際のTCP接続で
+    /// REALITY認証(X25519) → `secure_channel`による暗号化通信路の確立 →
+    /// VLESSリクエストの解析 → 実際の宛先への中継、までを一気通貫で確認する。
+    #[tokio::test]
+    async fn full_pipeline_reality_auth_to_encrypted_vless_relay() {
+        use crate::reality_auth::ClientEphemeralKeypair;
+
+        // VLESSリクエストが指す宛先役のモックサーバー(echo)。
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = destination_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+                let mut discard = [0u8; 1];
+                let _ = stream.read(&mut discard).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let identity = Arc::new(ServerIdentity::generate([50u8; 32]));
+        let client_ephemeral = ClientEphemeralKeypair::generate([51u8; 32]);
+        let auth_tag = client_ephemeral.derive_auth_tag(&identity.public_key());
+        let allowed_uuid = [8u8; 16];
+
+        let reality_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reality_addr = reality_listener.local_addr().unwrap();
+        let identity_for_server = Arc::clone(&identity);
+        let destination_port = destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let authenticated =
+                accept_and_route(&reality_listener, identity_for_server, |_| async {
+                    panic!("this test's client must always authenticate; camouflage path unused")
+                })
+                .await
+                .unwrap()
+                .expect("client must authenticate via REALITY");
+
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session_secure(
+                authenticated.stream,
+                &authenticated.channel_keys,
+                &allowed,
+                move |_address, port| async move {
+                    assert_eq!(port, destination_port);
+                    TcpStream::connect(("127.0.0.1", port)).await
+                },
+            )
+            .await
+        });
+
+        // クライアント側: 実際のREALITY ClientHello(X25519 key_share +
+        // 認証タグ)を送り、その後は同じX25519共有シークレットから導出した
+        // ChannelKeysでsecure_channelを組み立てて、VLESSリクエストを送る。
+        let mut client_tcp = TcpStream::connect(reality_addr).await.unwrap();
+        let client_hello = build_client_hello_with_key_share_for_tests(
+            &auth_tag,
+            "www.microsoft.com",
+            &client_ephemeral.public_key().to_bytes(),
+        );
+        client_tcp.write_all(&client_hello).await.unwrap();
+
+        let client_channel_keys = client_ephemeral.derive_channel_keys(&identity.public_key());
+        let (mut writer, mut reader) =
+            secure_channel::initiator_channel(client_tcp, &client_channel_keys);
+
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&allowed_uuid);
+        vless_request.push(0u8); // addons_len = 0
+        vless_request.push(1u8); // command = TCP
+        vless_request.extend_from_slice(&destination_port.to_be_bytes());
+        vless_request.push(1u8); // address_type = IPv4
+        vless_request.extend_from_slice(&[127, 0, 0, 1]);
+        vless_request.extend_from_slice(b"full-pipeline-payload");
+
+        writer.send(&vless_request).await.unwrap();
+
+        let response_header = reader.recv().await.unwrap();
+        assert_eq!(response_header, vec![0u8, 0u8]);
+
+        let echoed = reader.recv().await.unwrap();
+        assert_eq!(echoed, b"full-pipeline-payload");
+
+        // `drop(writer)`だけでは、`reader`がまだ生きているため
+        // `tokio::io::split`で共有された下層ソケットはクローズされず、
+        // サーバー側がEOFを検知できずハングする(実際に踏んだバグ)。
+        // 明示的に書き込み方向をシャットダウンする。
+        writer.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
     }
 

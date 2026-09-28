@@ -51,6 +51,45 @@ impl ServerIdentity {
         let shared_secret = self.secret.diffie_hellman(client_ephemeral_public);
         derive_tag_from_shared_secret(shared_secret.as_bytes())
     }
+
+    /// 認証タグと同じX25519 ECDH共有シークレットから、独自の暗号化通信路
+    /// (`secure_channel`)用の鍵を導出する(実装フェーズ10)。認証タグの
+    /// 導出とは別の`info`文字列を使うことで、2つの用途の鍵を暗号学的に
+    /// 分離する(1つの共有シークレットから複数の独立した鍵を作る際の
+    /// 標準的な作法)。
+    pub fn derive_channel_keys(&self, client_ephemeral_public: &PublicKey) -> ChannelKeys {
+        let shared_secret = self.secret.diffie_hellman(client_ephemeral_public);
+        derive_channel_keys_from_shared_secret(shared_secret.as_bytes())
+    }
+}
+
+/// 双方向通信のための2本の鍵(送信方向ごとに別の鍵を使うのは、TLS等でも
+/// 一般的な設計。1本の鍵を両方向で使い回すと、ノンス管理を誤った際に
+/// 深刻な脆弱性〈鍵ストリームの再利用〉につながりやすいため)。
+#[derive(Clone)]
+pub struct ChannelKeys {
+    pub initiator_to_responder: [u8; 32],
+    pub responder_to_initiator: [u8; 32],
+}
+
+fn derive_channel_keys_from_shared_secret(shared_secret: &[u8; 32]) -> ChannelKeys {
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut initiator_to_responder = [0u8; 32];
+    let mut responder_to_initiator = [0u8; 32];
+    hk.expand(
+        b"aruaru-vpn/reality/channel/initiator-to-responder/v1",
+        &mut initiator_to_responder,
+    )
+    .expect("32 bytes is a valid HKDF output length for SHA-256");
+    hk.expand(
+        b"aruaru-vpn/reality/channel/responder-to-initiator/v1",
+        &mut responder_to_initiator,
+    )
+    .expect("32 bytes is a valid HKDF output length for SHA-256");
+    ChannelKeys {
+        initiator_to_responder,
+        responder_to_initiator,
+    }
 }
 
 /// クライアント側のエフェメラル鍵ペア(接続のたびに使い捨てる)。
@@ -74,6 +113,13 @@ impl ClientEphemeralKeypair {
     pub fn derive_auth_tag(&self, server_public: &PublicKey) -> [u8; AUTH_TAG_LEN] {
         let shared_secret = self.secret.diffie_hellman(server_public);
         derive_tag_from_shared_secret(shared_secret.as_bytes())
+    }
+
+    /// [`ServerIdentity::derive_channel_keys`]のクライアント側版。ECDHの
+    /// 対称性により、双方が同じ`ChannelKeys`に到達する。
+    pub fn derive_channel_keys(&self, server_public: &PublicKey) -> ChannelKeys {
+        let shared_secret = self.secret.diffie_hellman(server_public);
+        derive_channel_keys_from_shared_secret(shared_secret.as_bytes())
     }
 }
 
@@ -128,6 +174,36 @@ mod tests {
         let client_tag = client.derive_auth_tag(&server.public_key());
 
         assert_eq!(server_tag, client_tag);
+    }
+
+    #[test]
+    fn client_and_server_derive_the_same_channel_keys() {
+        let server = ServerIdentity::generate(seed(3));
+        let client = ClientEphemeralKeypair::generate(seed(4));
+
+        let server_keys = server.derive_channel_keys(&client.public_key());
+        let client_keys = client.derive_channel_keys(&server.public_key());
+
+        assert_eq!(
+            server_keys.initiator_to_responder,
+            client_keys.initiator_to_responder
+        );
+        assert_eq!(
+            server_keys.responder_to_initiator,
+            client_keys.responder_to_initiator
+        );
+    }
+
+    #[test]
+    fn channel_keys_are_domain_separated_from_the_auth_tag_and_from_each_other() {
+        let server = ServerIdentity::generate(seed(5));
+        let client_public = ClientEphemeralKeypair::generate(seed(6)).public_key();
+
+        let tag = server.derive_auth_tag(&client_public);
+        let keys = server.derive_channel_keys(&client_public);
+
+        assert_ne!(&tag[..], &keys.initiator_to_responder[..tag.len()]);
+        assert_ne!(keys.initiator_to_responder, keys.responder_to_initiator);
     }
 
     #[test]

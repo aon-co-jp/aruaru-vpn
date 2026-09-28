@@ -365,3 +365,72 @@ PSK追加)を次フェーズとして統合して」を受け実装。`cargo tes
 「偽装先サイトの本物の証明書をそのまま使う」偽装(証明書クローン)は
 未実装。`accept_and_route`/`handle_relay_session`との実際の配線(今は
 独立したモジュールとして動作確認しただけ)も未着手。
+
+## 20. 実装フェーズ10(完了・2026-09-28): 独自セキュアトランスポート+実配線、致命的バグ2件を発見・修正
+
+**技術的な行き詰まりと方針転換**: `rustls`ベースのTLS終端を
+`accept_and_route`/`handle_relay_session`に実配線しようとしたところ、
+根本的な壁に突き当たった。私たちのREALITY認証はTLSの`ClientHello`
+`session_id`欄に独自の認証タグを埋め込む設計だが、`rustls`(標準準拠の
+TLS実装)はこの非標準な構造を受け付けない。本物のREALITY(Xray-core)は
+TLS実装自体を改造(uTLS等)することでこれを解決しているが、それは
+非常に大規模な作業になる。
+
+ユーザーと相談の上、2つの選択肢(A: 認証とTLSを分離する2段階方式、
+B: 自前のTLS 1.3相当レコード層を書く)を比較し、**ユーザーの意向により
+案B**を採用。ただし完全なTLS 1.3仕様準拠(既存TLSライブラリとの相互
+接続性)は目指さず、**REALITY認証(X25519 ECDH)で既に確立済みの共有鍵を
+そのまま使い、そこから独自にAEAD暗号化レコード層を導出する「自前の
+最小限のセキュアトランスポート」**として実装した。`cargo test`で
+65テスト全通過(既存59+新規6)。
+
+- [`src/reality_auth.rs`](src/reality_auth.rs): `derive_channel_keys`を
+  追加。認証タグの導出と**同じX25519 ECDH共有シークレット**から、HKDFで
+  「別の`info`文字列」を使って独立した`ChannelKeys`(送信方向ごとに2本の
+  鍵)を導出する(暗号学的な用途分離)。
+- [`src/secure_channel.rs`](src/secure_channel.rs): `ChannelKeys`を使い、
+  [ChaCha20-Poly1305](https://crates.io/crates/chacha20poly1305)
+  (監査済み、暗号プリミティブ自体は自作しない)による独自のAEAD
+  フレーミング(`[4バイト長][暗号文+認証タグ]`)を実装。`SecureWriter`/
+  `SecureReader`が送受信を担い、ノンスは接続ごとに0から単調増加させる
+  カウンタで管理(同じ鍵・同じノンスの再利用を防ぐ)。
+- [`src/net.rs`](src/net.rs): `accept_and_route`が認証成功時に
+  `ChannelKeys`も導出して返すように変更(`AuthenticatedConnection`型を
+  新設)。`handle_relay_session_secure`を追加し、`secure_channel`経由で
+  実際に暗号化されたVLESSセッションを処理できるようにした
+  (`Command::Tcp`のみ対応)。
+
+**開発中に見つけた致命的なバグ2件(ユーザー指示どおりTEST→DEBUGを反復して発見)**:
+
+1. **`tokio::io::split`の片方向クローズの誤解によるデッドロック**:
+   テストで`drop(writer)`により送信終了を伝えようとしたが、`split()`は
+   下層ストリームをArcで共有しているだけなので、`reader`側がまだ生きて
+   いる限り実際のソケットはクローズされず、相手はEOFを検知できずに
+   永久に待機し続けた。`SecureWriter::shutdown()`を追加し、明示的に
+   書き込み方向をシャットダウンすることで解決。
+2. **TLSレコード境界を超えた「まとめ読み」によるバイト列の消失**:
+   `accept_and_route`が「最大4096バイトを1回読み取る」実装のままだった
+   ため、クライアントがClientHelloの直後に続けてsecure_channelの
+   フレームを送ると、TCPがそれらを1回の読み取りにまとめてしまい、
+   ClientHelloを超えた分(VLESSリクエストの先頭)を読み捨ててしまう
+   欠陥があった。これが1と組み合わさり、`secure_channel`側が「新しい
+   バイトが来るのを待ち続ける」デッドロックとして顕在化していた。
+   TLSレコードヘッダの5バイトから実際の長さを読み取り、**ちょうど1
+   レコード分だけ**読む`read_exactly_one_tls_record`に置き換えて解決。
+
+**この2件のバグは、フルパイプラインのend-to-endテスト
+(`full_pipeline_reality_auth_to_encrypted_vless_relay`: 実TCP接続で
+REALITY認証→`secure_channel`確立→VLESS解析→実宛先への中継、を一気通貫で
+検証)を書いて初めて発覚した**。個々のモジュール単体のテストだけでは
+見つからない類のバグであり、「実配線してテストする」ことの重要性を
+実地で確認した。
+
+**残る制約・将来のロードマップ**: 現在の`secure_channel`は独自プロトコル
+であり、既存のTLSライブラリ・ブラウザ等とは相互接続できない。将来的な
+発展の方向性としては、(a) 短期: `Command::Udp`/`Mux`のsecure_channel対応、
+証明書クローンの検討再開、(b) 中期: 本物のTLS 1.3への準拠(uTLS相当の
+ClientHello偽装をゼロから実装するか、`key_share`に頼らない別の認証埋め込み
+方式を検討)、(c) 長期: 将来のTLSプロトコルの仕様改定(仮に「TLS 1.4」的な
+ものが登場した場合)への追従、を見据える。ただし(b)(c)は現時点では
+「アイデア・方向性」の域を出ず、実装着手の判断は都度の技術動向・
+必要性を見て行う。

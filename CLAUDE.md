@@ -95,6 +95,23 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-28 実装フェーズ10完了(独自セキュアトランスポート+実配線、
+  致命的バグ2件を発見・修正)**: `rustls`ベースのTLS終端を実配線しようと
+  したところ、私たちのREALITY認証(ClientHelloの`session_id`欄への
+  非標準な認証タグ埋め込み)が標準TLSライブラリと根本的に非互換だと
+  判明。ユーザーと相談し、完全なTLS 1.3準拠(既存ライブラリとの相互
+  接続性)は目指さず、**REALITY認証で確立済みのX25519共有鍵からAEAD
+  暗号化レコード層を独自導出する「自前の最小限のセキュアトランスポート」**
+  ([`src/secure_channel.rs`](src/secure_channel.rs)、ChaCha20-Poly1305は
+  監査済みcrateに委ね自作しない)を実装。`accept_and_route`/
+  `handle_relay_session_secure`([`src/net.rs`](src/net.rs))へ実配線し、
+  フルパイプラインのend-to-endテストを書いたところ、**(1)
+  `tokio::io::split`の片方向クローズを誤解した実装によるデッドロック、
+  (2)TLSレコード境界を超えた「まとめ読み」によるバイト列消失、という
+  致命的なバグ2件**を発見・修正(`SecureWriter::shutdown()`の追加、
+  `read_exactly_one_tls_record`への置き換え)。`cargo test`で65テスト
+  全通過。証明書クローン・secure_channelのUDP/MUX対応・将来の本物の
+  TLS 1.3準拠は引き続き未着手(ロードマップとして`PORTING.md`「20.」に記録)。
 - **2026-09-28 実装フェーズ9完了(実TLS終端の試作品)**: [`src/tls_terminate.rs`](src/tls_terminate.rs)
   で`rustls`/`tokio-rustls`を使い、自己署名証明書(`rcgen`で動的生成)に
   よる実際のTLSハンドシェイク完了を実装。`PrefixedStream`で

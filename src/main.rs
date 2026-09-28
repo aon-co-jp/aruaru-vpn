@@ -4,6 +4,7 @@ mod key_storage;
 mod net;
 mod reality;
 mod reality_auth;
+mod secure_channel;
 mod tls_clienthello;
 mod tls_terminate;
 mod vless;
