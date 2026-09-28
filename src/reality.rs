@@ -96,7 +96,10 @@ pub fn decide_from_client_hello_record(
     default_camouflage_target: &str,
 ) -> Result<ConnectionAction, crate::tls_clienthello::ParseError> {
     let parsed = crate::tls_clienthello::parse_client_hello(record)?;
-    let camouflage_target = parsed.server_name.as_deref().unwrap_or(default_camouflage_target);
+    let camouflage_target = parsed
+        .server_name
+        .as_deref()
+        .unwrap_or(default_camouflage_target);
     Ok(decide_connection_action(
         checker,
         &parsed.session_id,
@@ -222,8 +225,7 @@ mod tests {
         );
 
         let action =
-            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
-                .unwrap();
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example").unwrap();
         assert_eq!(action, ConnectionAction::Relay);
     }
 
@@ -247,8 +249,7 @@ mod tests {
         );
 
         let action =
-            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
-                .unwrap();
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example").unwrap();
         assert_eq!(
             action,
             ConnectionAction::Fallback {
@@ -266,8 +267,7 @@ mod tests {
         let record = build_client_hello_for_tests(b"whatever", "www.microsoft.com");
 
         let action =
-            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example")
-                .unwrap();
+            decide_from_client_hello_record_x25519(&identity, &record, "fallback.example").unwrap();
         assert_eq!(
             action,
             ConnectionAction::Fallback {

@@ -3,6 +3,7 @@
 //! (それまでは`main.rs`のみのバイナリクレートだった)。
 
 pub mod amnezia;
+pub mod cert_clone;
 pub mod integration;
 pub mod key_storage;
 pub mod net;

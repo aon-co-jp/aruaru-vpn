@@ -246,6 +246,7 @@ dependencies = [
  "eframe",
  "egui",
  "hkdf",
+ "hmac",
  "rand 0.10.3",
  "rand_core 0.10.1",
  "rcgen",

@@ -133,12 +133,14 @@ impl<R: tokio::io::AsyncRead + Unpin> SecureReader<R> {
             .checked_add(1)
             .expect("nonce counter must not wrap around within a single connection's lifetime");
 
-        self.cipher.decrypt(&nonce, ciphertext.as_slice()).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "AEAD authentication failed (tampered data, wrong key, or nonce desync)",
-            )
-        })
+        self.cipher
+            .decrypt(&nonce, ciphertext.as_slice())
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "AEAD authentication failed (tampered data, wrong key, or nonce desync)",
+                )
+            })
     }
 }
 
@@ -147,7 +149,10 @@ impl<R: tokio::io::AsyncRead + Unpin> SecureReader<R> {
 pub fn initiator_channel<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     keys: &ChannelKeys,
-) -> (SecureWriter<tokio::io::WriteHalf<S>>, SecureReader<tokio::io::ReadHalf<S>>)
+) -> (
+    SecureWriter<tokio::io::WriteHalf<S>>,
+    SecureReader<tokio::io::ReadHalf<S>>,
+)
 where
     S: Send,
 {
@@ -163,7 +168,10 @@ where
 pub fn responder_channel<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
     stream: S,
     keys: &ChannelKeys,
-) -> (SecureWriter<tokio::io::WriteHalf<S>>, SecureReader<tokio::io::ReadHalf<S>>)
+) -> (
+    SecureWriter<tokio::io::WriteHalf<S>>,
+    SecureReader<tokio::io::ReadHalf<S>>,
+)
 where
     S: Send,
 {
@@ -185,8 +193,10 @@ mod tests {
         let server_identity = ServerIdentity::generate([11u8; 32]);
         let client_keys_pair = ClientEphemeralKeypair::generate([22u8; 32]);
 
-        let server_channel_keys = server_identity.derive_channel_keys(&client_keys_pair.public_key());
-        let client_channel_keys = client_keys_pair.derive_channel_keys(&server_identity.public_key());
+        let server_channel_keys =
+            server_identity.derive_channel_keys(&client_keys_pair.public_key());
+        let client_channel_keys =
+            client_keys_pair.derive_channel_keys(&server_identity.public_key());
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -195,7 +205,10 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let (mut writer, mut reader) = responder_channel(stream, &server_channel_keys);
 
-            let received = reader.recv().await.expect("server must decrypt client's message");
+            let received = reader
+                .recv()
+                .await
+                .expect("server must decrypt client's message");
             assert_eq!(received, b"hello from client");
 
             writer
@@ -208,7 +221,10 @@ mod tests {
         let (mut writer, mut reader) = initiator_channel(client_stream, &client_channel_keys);
 
         writer.send(b"hello from client").await.unwrap();
-        let received = reader.recv().await.expect("client must decrypt server's reply");
+        let received = reader
+            .recv()
+            .await
+            .expect("client must decrypt server's reply");
         assert_eq!(received, b"hello from server");
 
         server_task.await.unwrap();
@@ -273,6 +289,9 @@ mod tests {
             .unwrap();
 
         let result = server_task.await.unwrap();
-        assert!(result.is_err(), "an absurd declared length must be rejected");
+        assert!(
+            result.is_err(),
+            "an absurd declared length must be rejected"
+        );
     }
 }

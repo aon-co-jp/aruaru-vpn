@@ -205,12 +205,9 @@ mod tests {
         let initiator_psk = [1u8; PSK_LEN];
         let responder_psk = [2u8; PSK_LEN]; // 意図的に異なるPSKを使わせる
 
-        let initiator = build_initiator_with_psk(
-            &initiator_peer,
-            &responder_peer.public_key,
-            &initiator_psk,
-        )
-        .unwrap();
+        let initiator =
+            build_initiator_with_psk(&initiator_peer, &responder_peer.public_key, &initiator_psk)
+                .unwrap();
         let responder = build_responder_with_psk(&responder_peer, &responder_psk).unwrap();
 
         // ハンドシェイク自体のメッセージ交換はPSKが違っても形の上では

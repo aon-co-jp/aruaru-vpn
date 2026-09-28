@@ -10,11 +10,13 @@
 
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
+use crate::cert_clone;
 use crate::reality_auth::{ChannelKeys, ServerIdentity};
 use crate::secure_channel;
+use crate::tls_terminate::PrefixedStream;
 use crate::vless::{self, Address, AllowedUuids, Command, VlessRequest};
 
 /// TCP接続を1本受け付け、その最初のTLS ClientHelloレコードを読み取って
@@ -87,7 +89,10 @@ where
         .as_ref()
         .and_then(|p| p.x25519_key_share)
         .map(x25519_dalek::PublicKey::from);
-    let session_id = parsed.as_ref().map(|p| p.session_id.clone()).unwrap_or_default();
+    let session_id = parsed
+        .as_ref()
+        .map(|p| p.session_id.clone())
+        .unwrap_or_default();
     let sni = parsed.as_ref().and_then(|p| p.server_name.clone());
 
     let authenticated = client_public_key
@@ -117,6 +122,86 @@ where
     }
 }
 
+/// [`accept_and_route`]の証明書クローン版(実装フェーズ15・16):
+/// `secure_channel`の独自フレーミングの代わりに、`cert_clone`で組み立てた
+/// 「本物の証明書チェーンを借用したTLS 1.3」で通信路を確立する。
+/// ワイヤー上のバイト列が本物のTLS 1.3と区別できなくなる分、
+/// `secure_channel`版より検閲耐性が高い(`PORTING.md`「25.」参照)。
+///
+/// **認証方式が`accept_and_route`(session_idの認証タグ)と異なる点に注意**:
+/// ここでは`key_share`拡張のX25519公開鍵そのものを、事前登録済みリスト
+/// (`allowed_client_keys`)と照合する方式を使う。session_idへ認証タグを
+/// 埋め込む方式は、標準準拠の`rustls`クライアントとは組み合わせられない
+/// ことが判明したため([`crate::reality_auth::AllowedClientKeys`]の
+/// ドキュメント参照、`PORTING.md`「26.」)。
+///
+/// `camouflage_port`は偽装先サイトへ証明書取得のために実際に接続する
+/// ポート(実運用では443、テストではモックTLSサーバーの任意ポート)。
+pub async fn accept_and_route_cert_cloned(
+    listener: &TcpListener,
+    identity: Arc<ServerIdentity>,
+    allowed_client_keys: &crate::reality_auth::AllowedClientKeys,
+    camouflage_port: u16,
+) -> std::io::Result<Option<tokio_rustls::server::TlsStream<PrefixedStream<TcpStream>>>> {
+    let (mut client_stream, _peer_addr) = listener.accept().await?;
+    let record = read_exactly_one_tls_record(&mut client_stream).await?;
+
+    let parsed = crate::tls_clienthello::parse_client_hello(&record).ok();
+    let client_public_key = parsed
+        .as_ref()
+        .and_then(|p| p.x25519_key_share)
+        .map(x25519_dalek::PublicKey::from);
+    let sni = parsed.as_ref().and_then(|p| p.server_name.clone());
+
+    let authenticated = client_public_key
+        .as_ref()
+        .map(|pk| allowed_client_keys.is_allowed(pk))
+        .unwrap_or(false);
+
+    if !authenticated {
+        let camouflage_target = sni.unwrap_or_else(|| "www.microsoft.com".to_owned());
+        let mut camouflage_stream =
+            TcpStream::connect((camouflage_target.as_str(), camouflage_port)).await?;
+        camouflage_stream.write_all(&record).await?;
+        tokio::io::copy_bidirectional(&mut client_stream, &mut camouflage_stream).await?;
+        return Ok(None);
+    }
+
+    // unwrapは安全: `authenticated`がtrueになるのは`client_public_key`が
+    // `Some`のときだけ(上の`map`参照)。
+    let client_pub = client_public_key.as_ref().unwrap();
+    let auth_key = identity.derive_cert_clone_auth_key(client_pub);
+    let camouflage_target = sni.unwrap_or_else(|| "www.microsoft.com".to_owned());
+
+    let real_cert_chain =
+        cert_clone::fetch_real_certificate_chain(&camouflage_target, camouflage_port).await?;
+    let acceptor = cert_clone::build_cloned_server_acceptor(real_cert_chain, auth_key)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    // クライアントが最初に送ってきたClientHelloは、REALITY判定のために
+    // 既に読み取り済み(=消費済み)。rustlsが標準のTLS 1.3ハンドシェイクを
+    // 自分で処理できるよう、`PrefixedStream`でそのバイト列を「巻き戻す」
+    // (`tls_terminate.rs`のドキュメント参照、実装フェーズ9と同じ手法)。
+    let prefixed = PrefixedStream::new(record, client_stream);
+    let tls_stream = acceptor.accept(prefixed).await?;
+    Ok(Some(tls_stream))
+}
+
+/// [`accept_and_route_cert_cloned`]が返すTLS 1.3ストリームから、実際に
+/// VLESSリクエストを読み取り、指定された宛先へ中継する(`handle_relay_session`
+/// の薄いラッパー、実装フェーズ16)。
+pub async fn handle_relay_session_cert_cloned<F, Fut>(
+    tls_stream: tokio_rustls::server::TlsStream<PrefixedStream<TcpStream>>,
+    allowed_uuids: &AllowedUuids,
+    dial_destination: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(Address, u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
+{
+    handle_relay_session(tls_stream, allowed_uuids, dial_destination).await
+}
+
 /// `accept_and_route`が`Relay`と判定して返した`TcpStream`から、実際に
 /// VLESSリクエストヘッダを読み取り、指定された宛先へ実際に接続して
 /// 中継する(実装フェーズ7: VLESSプロトコル本体の統合)。
@@ -138,12 +223,18 @@ where
 /// 「どの利用者か」を検証する二段構えの認証(実際のXray-coreと同じ設計)。
 /// 許可されていないUUIDのリクエストは、宛先への接続を試みることなく
 /// エラーとして拒否する。
-pub async fn handle_relay_session<F, Fut>(
-    mut client_stream: TcpStream,
+///
+/// `client_stream`は`AsyncRead`/`AsyncWrite`を実装する任意のストリーム型
+/// (実TCP接続そのものだけでなく、実装フェーズ15の`cert_clone`が返す
+/// TLS 1.3ストリームもここへそのまま渡せる、`handle_relay_session_cert_cloned`
+/// 参照)。
+pub async fn handle_relay_session<S, F, Fut>(
+    mut client_stream: S,
     allowed_uuids: &AllowedUuids,
     dial_destination: F,
 ) -> std::io::Result<()>
 where
+    S: AsyncRead + AsyncWrite + Unpin,
     F: FnOnce(Address, u16) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
 {
@@ -274,8 +365,15 @@ where
             Ok(())
         }
         Command::Udp => {
-            relay_udp_secure(&mut writer, &mut reader, address, port, leftover_payload, version)
-                .await
+            relay_udp_secure(
+                &mut writer,
+                &mut reader,
+                address,
+                port,
+                leftover_payload,
+                version,
+            )
+            .await
         }
         Command::Mux => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
@@ -313,7 +411,10 @@ where
         Address::Domain(domain) => {
             let mut addrs = tokio::net::lookup_host((domain.as_str(), port)).await?;
             addrs.next().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "domain resolved to no address")
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "domain resolved to no address",
+                )
             })?
         }
     };
@@ -362,8 +463,8 @@ where
 /// 1個のUDPデータグラムとして送り、宛先からの応答をクライアントへそのまま
 /// 返す」という往復1回分の最小疎通確認に留める(複数データグラムの
 /// フレーミングは次フェーズ)。
-async fn relay_udp(
-    mut client_stream: TcpStream,
+async fn relay_udp<S: AsyncWrite + Unpin>(
+    mut client_stream: S,
     address: Address,
     port: u16,
     initial_payload: Vec<u8>,
@@ -374,7 +475,10 @@ async fn relay_udp(
         Address::Domain(domain) => {
             let mut addrs = tokio::net::lookup_host((domain.as_str(), port)).await?;
             addrs.next().ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "domain resolved to no address")
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "domain resolved to no address",
+                )
             })?
         }
     };
@@ -406,7 +510,9 @@ pub async fn perform_handshake_over_udp(
 
     // メッセージ1: initiator → (UDP) → responder
     let len = initiator.write_message(&[], &mut buf)?;
-    initiator_socket.send_to(&buf[..len], responder_addr).await?;
+    initiator_socket
+        .send_to(&buf[..len], responder_addr)
+        .await?;
 
     let mut recv_buf = [0u8; 1024];
     let (n, from) = responder_socket.recv_from(&mut recv_buf).await?;
@@ -429,7 +535,7 @@ mod tests {
     use super::*;
     use crate::reality_auth::ClientEphemeralKeypair;
     use crate::tls_clienthello::tests_support::build_client_hello_with_key_share_for_tests;
-    use crate::wireguard_handshake::{build_initiator, build_responder, Peer};
+    use crate::wireguard_handshake::{Peer, build_initiator, build_responder};
     use tokio::net::TcpListener;
 
     /// 認証失敗(未登録のREALITYクライアント)の接続が、実際のTCP接続として
@@ -461,12 +567,13 @@ mod tests {
         let reality_addr = reality_listener.local_addr().unwrap();
         let identity = Arc::new(ServerIdentity::generate([9u8; 32]));
 
-        let server_task = tokio::spawn(async move {
-            accept_and_route(&reality_listener, identity, move |_camouflage_target| async move {
+        let server_task =
+            tokio::spawn(async move {
+                accept_and_route(&reality_listener, identity, move |_camouflage_target| async move {
                 TcpStream::connect(camouflage_addr).await
             })
             .await
-        });
+            });
 
         // クライアント役: 認証タグなし(session_idが空)の、未認証な
         // ClientHelloを送る。
@@ -477,14 +584,20 @@ mod tests {
 
         let mut echoed = vec![0u8; record.len()];
         client.read_exact(&mut echoed).await.unwrap();
-        assert_eq!(echoed, record, "fallback path must echo back via the camouflage target");
+        assert_eq!(
+            echoed, record,
+            "fallback path must echo back via the camouflage target"
+        );
 
         // クライアント側から明示的に接続を終える(EOFを送る)。これが
         // 中継先(モックの偽装サイト)まで伝わり、双方が正常にクローズできる。
         client.shutdown().await.unwrap();
 
         let result = server_task.await.unwrap().unwrap();
-        assert!(result.is_none(), "fallback path must not return a Relay stream");
+        assert!(
+            result.is_none(),
+            "fallback path must not return a Relay stream"
+        );
     }
 
     /// 認証成功(登録済みREALITYクライアント)の接続は、偽装先へは転送されず
@@ -515,7 +628,10 @@ mod tests {
         client.write_all(&record).await.unwrap();
 
         let result = server_task.await.unwrap().unwrap();
-        assert!(result.is_some(), "authenticated client must be handed back for Relay handling");
+        assert!(
+            result.is_some(),
+            "authenticated client must be handed back for Relay handling"
+        );
     }
 
     /// REALITY認証を通過した接続が、実際にVLESSリクエストヘッダで指定した
@@ -899,5 +1015,194 @@ mod tests {
             .read_message(&ciphertext[..ct_len], &mut decrypted)
             .unwrap();
         assert_eq!(&decrypted[..pt_len], plaintext);
+    }
+
+    /// 証明書クローン(実装フェーズ15・16)の`accept_and_route_cert_cloned`
+    /// のうち、**未認証接続が偽装先へ透過転送されるフォールバック側**の
+    /// 経路が実際のTCP接続で動くことを確認する。
+    ///
+    /// **設計変更の経緯(`PORTING.md`「26.」に詳細記録)**: 当初は
+    /// `accept_and_route`(`secure_channel`版)と同じ「ClientHelloの
+    /// `session_id`にECDH認証タグを埋め込む」方式を試したが、標準準拠の
+    /// `rustls`クライアントと組み合わせると、TLS1.3のトランスクリプト
+    /// ハッシュ(ClientHelloの生バイト列全体から計算される)が送信後の
+    /// 書き換えで壊れ、`Finished`検証が`DecryptError`で失敗することが
+    /// 判明した(本物のREALITYがGoの`crypto/tls`を丸ごとフォークしている
+    /// のはこれが理由)。そこで`key_share`拡張のX25519公開鍵そのものを
+    /// 事前登録リストと照合する方式(`AllowedClientKeys`)へ変更した。
+    #[tokio::test]
+    async fn accept_and_route_cert_cloned_relays_unauthenticated_connection_to_camouflage_target() {
+        let camouflage_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let camouflage_port = camouflage_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = camouflage_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+                let mut discard = [0u8; 1];
+                let _ = stream.read(&mut discard).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let reality_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reality_addr = reality_listener.local_addr().unwrap();
+        let identity = Arc::new(ServerIdentity::generate([95u8; 32]));
+        let allowed_keys = crate::reality_auth::AllowedClientKeys::default();
+
+        let server_task = tokio::spawn(async move {
+            accept_and_route_cert_cloned(
+                &reality_listener,
+                identity,
+                &allowed_keys,
+                camouflage_port,
+            )
+            .await
+        });
+
+        // クライアント役: 未登録の(=許可リストに無い)エフェメラル鍵で
+        // 接続する未認証なClientHelloを送る(127.0.0.1宛の偽装先へ実際に
+        // TCP接続できるよう、SNIには"127.0.0.1"を使う)。
+        let mut client = TcpStream::connect(reality_addr).await.unwrap();
+        let record = build_client_hello_with_key_share_for_tests(b"", "127.0.0.1", &[0u8; 32]);
+        client.write_all(&record).await.unwrap();
+
+        let mut echoed = vec![0u8; record.len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(
+            echoed, record,
+            "fallback path must echo back via the camouflage target"
+        );
+
+        client.shutdown().await.unwrap();
+
+        let result = server_task.await.unwrap().unwrap();
+        assert!(
+            result.is_none(),
+            "fallback path must not return a cloned TLS stream"
+        );
+    }
+
+    /// 証明書クローン(実装フェーズ15・16)のフルパイプラインend-to-end
+    /// テスト: 実際のTCP接続で、REALITY認証(`key_share`の公開鍵を事前
+    /// 登録リストと照合)→本物の証明書チェーンを偽装先から借用したTLS 1.3
+    /// ハンドシェイクの完了(`cert_clone`)→VLESSリクエストの解析→実際の
+    /// 宛先への中継、までを一気通貫で確認する。クライアントは
+    /// `tokio_rustls`が生成する**本物のTLS 1.3 ClientHello**を使う
+    /// (独自フレーミングではない、`key_share`の鍵だけを
+    /// `FixedX25519ActiveKeyExchange`経由で固定する)。
+    #[tokio::test]
+    async fn full_pipeline_cert_cloned_reality_auth_to_real_tls13_vless_relay() {
+        use rustls::pki_types::ServerName;
+
+        // 偽装先サイト役(自己署名証明書のモックTLSサーバー、"localhost"
+        // 向け)。REALITY認証が成功すると、サーバーはこのサイトへ実際に
+        // 接続して本物の証明書チェーンを借用する。
+        let (camouflage_cert, camouflage_key) =
+            crate::tls_terminate::generate_self_signed_cert("localhost").unwrap();
+        let camouflage_acceptor =
+            crate::tls_terminate::build_server_acceptor(camouflage_cert, camouflage_key).unwrap();
+        let camouflage_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let camouflage_port = camouflage_listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = camouflage_listener.accept().await else {
+                    break;
+                };
+                if let Ok(mut tls) = camouflage_acceptor.accept(tcp).await {
+                    let mut buf = [0u8; 16];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls.shutdown().await;
+                }
+            }
+        });
+
+        // VLESSリクエストが指す「宛先」役のモックサーバー(echo、証明書
+        // クローンのTLSとは無関係な、REALITY中継後のVLESS宛先)。
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = destination_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+                let mut discard = [0u8; 1];
+                let _ = stream.read(&mut discard).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let identity = Arc::new(ServerIdentity::generate([90u8; 32]));
+        let ephemeral_seed = [91u8; 32];
+        let client_ephemeral_public = {
+            let secret = x25519_dalek::StaticSecret::from(ephemeral_seed);
+            x25519_dalek::PublicKey::from(&secret)
+        };
+        let client_auth_key = identity.derive_cert_clone_auth_key(&client_ephemeral_public);
+        let allowed_keys =
+            crate::reality_auth::AllowedClientKeys::new([*client_ephemeral_public.as_bytes()]);
+        let allowed_uuid = [15u8; 16];
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let destination_port = destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let tls_stream = accept_and_route_cert_cloned(
+                &relay_listener,
+                identity,
+                &allowed_keys,
+                camouflage_port,
+            )
+            .await
+            .unwrap()
+            .expect("registered client must authenticate and complete the cloned TLS handshake");
+
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session_cert_cloned(
+                tls_stream,
+                &allowed,
+                move |_address, port| async move {
+                    assert_eq!(port, destination_port);
+                    TcpStream::connect(("127.0.0.1", port)).await
+                },
+            )
+            .await
+        });
+
+        // クライアント側: 本物のrustls TLSクライアントを、事前登録した
+        // エフェメラル鍵をTLS鍵交換自体にも使う形で組み立てる。
+        let client_connector = cert_clone::build_cloned_client_connector_with_reality_ephemeral(
+            client_auth_key,
+            ephemeral_seed,
+        );
+        let tcp = TcpStream::connect(relay_addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap();
+        let mut client_tls = client_connector.connect(server_name, tcp).await.unwrap();
+
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&allowed_uuid);
+        vless_request.push(0u8); // addons_len = 0
+        vless_request.push(1u8); // command = TCP
+        vless_request.extend_from_slice(&destination_port.to_be_bytes());
+        vless_request.push(1u8); // address_type = IPv4
+        vless_request.extend_from_slice(&[127, 0, 0, 1]);
+        vless_request.extend_from_slice(b"cert-cloned-pipeline-payload");
+
+        client_tls.write_all(&vless_request).await.unwrap();
+
+        let mut response_header = [0u8; 2];
+        client_tls.read_exact(&mut response_header).await.unwrap();
+        assert_eq!(response_header, [0u8, 0u8]);
+
+        let mut echoed = vec![0u8; b"cert-cloned-pipeline-payload".len()];
+        client_tls.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"cert-cloned-pipeline-payload");
+
+        client_tls.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
     }
 }

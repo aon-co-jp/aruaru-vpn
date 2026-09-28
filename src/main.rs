@@ -1,8 +1,8 @@
-use aruaru_vpn::amnezia::{plan_handshake_send_sequence, ObfuscationConfig};
+use aruaru_vpn::amnezia::{ObfuscationConfig, plan_handshake_send_sequence};
 use aruaru_vpn::integration::{
     CpuOnlyCryptoAccelerator, CryptoAccelerator, NoOpTrafficShaper, TrafficShaper,
 };
-use aruaru_vpn::reality::{decide_connection_action, ConnectionAction, RealityAuthChecker};
+use aruaru_vpn::reality::{ConnectionAction, RealityAuthChecker, decide_connection_action};
 
 fn main() {
     let checker = RealityAuthChecker::new([b"example-short-id".to_vec()]);

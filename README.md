@@ -144,7 +144,44 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
 
 ## 現在の到達点
 
-2026-09-27時点: リポジトリ新設、Outline VPN/Algo VPNのアーキテクチャ調査、
-開発方針(用途を隠さない、利用者自身がVPSを運用する主体)の決定、
-透明性告知文(日英+主要30言語)の作成まで完了。実装は未着手。次回再開
-ポイントは[`PORTING.md`](PORTING.md)を参照。
+2026-09-29時点(実装フェーズ16完了、`cargo test`で74テスト全通過):
+
+- REALITY認証(X25519 ECDH)→本物の証明書チェーンを偽装先サイトから
+  実際に借用したTLS 1.3ハンドシェイク(`cert_clone`、
+  [rustls](https://crates.io/crates/rustls)の公開拡張点を使い、rustls自体は
+  フォークせず実装)→VLESS UUID検証→実TCP/UDP中継、まで実配線・
+  動作確認済み(本物の`rustls`クライアントを使ったフルパイプライン
+  end-to-endテストが実際に成功)。
+- `secure_channel`(独自AEADフレーミング)経由の代替経路も併存
+  (`Command::Udp`対応済み)。
+- 鍵管理GUI([`src/bin/keys_gui.rs`](src/bin/keys_gui.rs)、egui/eframe+rfd)。
+- 透明性告知文(日英+主要30言語、AIによる自己レビュー実施済み・
+  ネイティブ検証は未実施)。
+
+未着手・既知の制約は[`CLAUDE.md`](CLAUDE.md)「HANDOFF」節、詳細な設計判断・
+実装経緯は[`PORTING.md`](PORTING.md)を参照。
+
+## Current Status (English summary)
+
+As of 2026-09-29 (implementation phase 16, `cargo test`: 74/74 passing):
+
+- REALITY authentication (X25519 ECDH) → a real TLS 1.3 handshake that
+  borrows a genuine certificate chain live from the camouflage target site
+  (`cert_clone`, built on [rustls](https://crates.io/crates/rustls)'s public
+  extension points — `SigningKey`, `ServerCertVerifier`, `SupportedKxGroup` —
+  without forking rustls itself) → VLESS UUID validation → real TCP/UDP
+  relaying, all wired up and verified end-to-end with a real `rustls`
+  client.
+- An alternative path over `secure_channel` (a custom AEAD framing) also
+  exists (`Command::Udp` supported there too).
+- A native key-management GUI ([`src/bin/keys_gui.rs`](src/bin/keys_gui.rs),
+  egui/eframe + rfd).
+- The transparency notice (Japanese/English plus ~30 languages), with an
+  AI self-review pass completed — native-speaker verification is still
+  outstanding for all languages.
+
+See [`CLAUDE.md`](CLAUDE.md) ("HANDOFF") for open items and known
+limitations, and [`PORTING.md`](PORTING.md) for the detailed design
+history (notably phases 25–26: two fundamental incompatibilities discovered
+and resolved while integrating a standard TLS 1.3 client with the
+certificate-cloning path).

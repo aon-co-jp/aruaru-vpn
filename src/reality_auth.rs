@@ -15,6 +15,8 @@
 //! エコシステム方針であっても重大なセキュリティリスクになるため、この方針
 //! の対象外とする(一般的なベストプラクティス)。
 
+use std::collections::HashSet;
+
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -60,6 +62,18 @@ impl ServerIdentity {
     pub fn derive_channel_keys(&self, client_ephemeral_public: &PublicKey) -> ChannelKeys {
         let shared_secret = self.secret.diffie_hellman(client_ephemeral_public);
         derive_channel_keys_from_shared_secret(shared_secret.as_bytes())
+    }
+
+    /// 認証タグ・`ChannelKeys`と同じX25519 ECDH共有シークレットから、
+    /// [`crate::cert_clone`](実装フェーズ15)が使う64バイトの`AuthKey`を
+    /// 導出する。この鍵はHMAC-SHA512の鍵として使われ、本物のREALITYが
+    /// 「証明書の署名フィールドをHMAC値に差し替える」際の鍵と同じ役割を
+    /// 果たす(出力を64バイトにしているのは、Ed25519署名の長さ〈64バイト〉
+    /// に合わせ、TLS 1.3のCertificateVerifyメッセージのワイヤーフォーマット
+    /// にそのまま収まるようにするため)。
+    pub fn derive_cert_clone_auth_key(&self, client_ephemeral_public: &PublicKey) -> [u8; 64] {
+        let shared_secret = self.secret.diffie_hellman(client_ephemeral_public);
+        derive_cert_clone_auth_key_from_shared_secret(shared_secret.as_bytes())
     }
 }
 
@@ -121,6 +135,22 @@ impl ClientEphemeralKeypair {
         let shared_secret = self.secret.diffie_hellman(server_public);
         derive_channel_keys_from_shared_secret(shared_secret.as_bytes())
     }
+
+    /// [`ServerIdentity::derive_cert_clone_auth_key`]のクライアント側版。
+    pub fn derive_cert_clone_auth_key(&self, server_public: &PublicKey) -> [u8; 64] {
+        let shared_secret = self.secret.diffie_hellman(server_public);
+        derive_cert_clone_auth_key_from_shared_secret(shared_secret.as_bytes())
+    }
+}
+
+const CERT_CLONE_AUTH_KEY_HKDF_INFO: &[u8] = b"aruaru-vpn/reality/cert-clone-auth-key/v1";
+
+fn derive_cert_clone_auth_key_from_shared_secret(shared_secret: &[u8; 32]) -> [u8; 64] {
+    let hk = Hkdf::<Sha256>::new(None, shared_secret);
+    let mut auth_key = [0u8; 64];
+    hk.expand(CERT_CLONE_AUTH_KEY_HKDF_INFO, &mut auth_key)
+        .expect("64 bytes is a valid HKDF output length for SHA-256");
+    auth_key
 }
 
 fn derive_tag_from_shared_secret(shared_secret: &[u8; 32]) -> [u8; AUTH_TAG_LEN] {
@@ -138,11 +168,60 @@ pub fn verify_auth_tag(
     client_ephemeral_public: &PublicKey,
     presented_tag: &[u8],
 ) -> bool {
-    if presented_tag.len() != AUTH_TAG_LEN {
+    // `presented_tag`は本来のTLSの`session_id`フィールド(0〜32バイト)
+    // そのものであることがある。標準準拠のTLSクライアント(`rustls`等)が
+    // 生成した32バイトのlegacy_session_idの**先頭`AUTH_TAG_LEN`バイトだけ**
+    // を認証タグに差し替える設計(`cert_clone`の`SessionIdPatchingStream`
+    // 参照、実装フェーズ15)のため、長さが一致しない場合は先頭部分だけを
+    // 比較する。TLS 1.3ではlegacy_session_idの中身自体に暗号学的な意味は
+    // 無い(middlebox互換のためだけに存在するフィールド)ため、この差し替え
+    // はTLSプロトコル自体には一切影響しない。
+    if presented_tag.len() < AUTH_TAG_LEN {
         return false;
     }
     let expected = identity.derive_auth_tag(client_ephemeral_public);
-    constant_time_eq(&expected, presented_tag)
+    constant_time_eq(&expected, &presented_tag[..AUTH_TAG_LEN])
+}
+
+/// [`crate::cert_clone`]用の、事前登録済みクライアント公開鍵の許可リスト
+/// (実装フェーズ16)。
+///
+/// **設計上の経緯**: `session_id`にECDH由来の認証タグを埋め込む方式
+/// (`verify_auth_tag`)は、`secure_channel`(独自フレーミング、こちらは
+/// 双方とも自前実装なので問題無い)では機能するが、`cert_clone`(標準準拠の
+/// `rustls`クライアントと相互運用する必要がある)では**根本的に機能しない**
+/// ことが実装フェーズ16で判明した: TLS 1.3のハンドシェイク鍵は
+/// ClientHelloの生バイト列全体のトランスクリプトハッシュから導出されるため、
+/// `rustls`が内部で構築したClientHelloの`session_id`を送信後に書き換えると、
+/// クライアント側の内部状態と実際に送信されたバイト列が食い違い、
+/// `Finished`メッセージの検証が失敗する(`PORTING.md`「26.」に詳細記録)。
+///
+/// そこで`cert_clone`では、`key_share`拡張のX25519公開鍵**そのもの**を
+/// クライアントの識別子として使う(この値はClientHello構築時から一貫して
+/// 使われる値であり、後から書き換える必要が無い)。`vless::AllowedUuids`
+/// と同じ「事前登録済みの識別子の許可リスト」という設計を踏襲する。
+///
+/// **既知のトレードオフ**: TLS1.3の`key_share`は本来エフェメラル(接続毎に
+/// 使い捨て)であるべきだが、この設計ではクライアントが**固定の**識別鍵を
+/// 繰り返し使うため、観測者がクライアントを複数接続にわたって追跡できて
+/// しまう(プライバシー上の弱化)。`wireguard_handshake.rs`の`Peer`が既に
+/// 同種の固定長期鍵を使っているのと同じ設計判断であり、TLS1.3セッション
+/// 自体の前方秘匿性(サーバー側エフェメラル鍵は毎回新規)は失われない。
+#[derive(Debug, Clone, Default)]
+pub struct AllowedClientKeys {
+    keys: HashSet<[u8; 32]>,
+}
+
+impl AllowedClientKeys {
+    pub fn new(keys: impl IntoIterator<Item = [u8; 32]>) -> Self {
+        Self {
+            keys: keys.into_iter().collect(),
+        }
+    }
+
+    pub fn is_allowed(&self, key: &PublicKey) -> bool {
+        self.keys.contains(key.as_bytes())
+    }
 }
 
 /// タイミング攻撃を避けるための定数時間バイト列比較。
@@ -174,6 +253,21 @@ mod tests {
         let client_tag = client.derive_auth_tag(&server.public_key());
 
         assert_eq!(server_tag, client_tag);
+    }
+
+    #[test]
+    fn client_and_server_derive_the_same_cert_clone_auth_key() {
+        let server = ServerIdentity::generate(seed(11));
+        let client = ClientEphemeralKeypair::generate(seed(12));
+
+        let server_key = server.derive_cert_clone_auth_key(&client.public_key());
+        let client_key = client.derive_cert_clone_auth_key(&server.public_key());
+
+        assert_eq!(server_key, client_key);
+        assert_ne!(
+            server_key.to_vec(),
+            server.derive_auth_tag(&client.public_key()).to_vec()
+        );
     }
 
     #[test]

@@ -563,3 +563,118 @@ aruaru-vpn-keys.exe`を実際に起動してクラッシュせず待機し続け
 相対的に低い。これらの言語を含め、**全言語について正式なネイティブ検証は
 未実施のまま**であることに変わりはなく、`TRANSPARENCY_NOTICE.md`冒頭の
 注意書きは変更していない(AI自己レビュー実施の旨のみ追記)。
+
+## 25. 実装フェーズ15(完了・2026-09-29): 証明書クローン、訂正と本実装
+
+「22.」で「現在のアーキテクチャでは証明書クローンは不要」と結論づけたが、
+ユーザーからの指示を受けて世界中の技術文書([XTLS/REALITY](https://github.com/XTLS/REALITY)、
+[Xray-core](https://github.com/XTLS/Xray-core)のソース・Issue・中国語/英語の
+技術解説記事)を多数調査した結果、**その結論は誤りだった**と判明したため
+訂正する。
+
+**訂正内容**: 本物のREALITYが証明書クローンをする理由は「クライアント
+自身がTLS証明書検証をするかどうか」ではなく、**「第三者の検閲装置(DPI)が
+ワイヤー上のバイト列を観測したときに、本物のサイトへの普通のTLS接続と
+区別がつくかどうか」**である。実装フェーズ10で導入した`secure_channel`
+(独自の`[4バイト長][暗号文]`フレーミング)は、ClientHelloの直後から
+明らかに非TLS構造のバイト列に切り替わるため、この脅威モデルに対して
+脆弱だった。
+
+**本物のREALITYの仕組み(調査結果)**:
+1. サーバーは偽装先サイトへ実際にライブ接続し(または過去のハンドシェイク
+   結果をキャッシュし)、本物のServerHello/証明書チェーンを取得する
+   (「盗む」対象は秘密鍵ではなく、公開情報である証明書バイト列)。
+2. その証明書の**署名フィールドだけ**を、X25519 ECDH由来の`AuthKey`による
+   HMAC-SHA512値に差し替える(「一時証明書」、Ed25519署名〈64バイト〉と
+   同じ長さになるようスキームを偽装)。
+3. 正規クライアント(uTLS改造TLSクライアント)は通常の証明書チェーン検証を
+   行わず、このHMAC値を自分で再計算して照合する。
+4. 鍵交換・レコード層の暗号化・ハンドシェイクの全体構造は標準のTLS 1.3の
+   まま変更しないため、ワイヤー上のバイト列が本物のTLS 1.3と区別できない。
+
+**実装方針**: 本物のXray-core REALITYはGoの`crypto/tls`標準ライブラリ自体を
+フォークする大規模な実装になっている(Go標準ライブラリが十分な拡張点を
+公開していないため)。調査の結果、Rustには同等のREALITY実装は存在しない
+ことを確認したが、[rustls](https://crates.io/crates/rustls)はこの目的に
+必要な拡張点(`SigningKey`/`Signer`/`ResolvesServerCert`/`ServerCertVerifier`)
+を標準APIとして公開しているため、**rustls自体をフォークせずに実装できる**
+ことが分かった。新設した[`src/cert_clone.rs`](src/cert_clone.rs)で:
+
+- `fetch_real_certificate_chain`: 偽装先サイトへ実際にTLS接続し、本物の
+  公開証明書チェーンを取得する。
+- `AuthKeySigner`/`AuthKeySigningKey`(`SigningKey`/`Signer`実装): 本物の
+  秘密鍵の代わりにHMAC-SHA512値を「署名」として返す。
+- `ClonedCertResolver`(`ResolvesServerCert`実装): 借用した本物の証明書
+  チェーン+上記の署名鍵を常に返す。
+- `AuthKeyVerifier`(クライアント側`ServerCertVerifier`実装): 通常の
+  チェーン検証をせず、同じHMAC-SHA512値を再計算して照合する。
+
+`reality_auth.rs`に`derive_cert_clone_auth_key`(64バイトのHMAC鍵をHKDFで
+導出、認証タグ・`ChannelKeys`とは別の`info`文字列で暗号学的に分離)を追加。
+
+`cargo test`で、実際に自己署名証明書のモックTLSサーバーから本物の証明書
+チェーンを取得し、それを借用してTLS 1.3ハンドシェイクが実際に成立し、
+暗号化されたアプリケーションデータの往復ができることを確認(4テスト:
+証明書取得・フルハンドシェイク成立・誤ったAuthKeyでの失敗確認・AuthKey
+導出の対称性)。
+
+## 26. 実装フェーズ16(完了・2026-09-29): rustls標準クライアントとの統合、認証方式の設計変更
+
+「25.」の`cert_clone`を`net.rs`(`accept_and_route`/`handle_relay_session`)へ
+実配線し、本物の`rustls`クライアントを使ったフルパイプラインend-to-end
+テストを書く過程で、**もう1つの根本的な非互換性**を発見した。
+
+**発見した問題**: `accept_and_route`(`secure_channel`版)と同じ「ClientHello
+の`session_id`にECDH認証タグを埋め込み、送信後に後から書き換える」方式
+(`SessionIdPatchingStream`として実装、`patch_session_id_prefix`)を試した
+ところ、TLSハンドシェイクが`DecryptError`で失敗した。原因: **TLS 1.3の
+ハンドシェイク鍵は、ClientHelloの生バイト列全体(`legacy_session_id`
+フィールドを含む)のトランスクリプトハッシュから導出される**。`rustls`が
+内部で構築したClientHelloの`session_id`を送信後に書き換えると、クライアント
+側が内部的に計算したトランスクリプトハッシュ(未パッチのバイト列で計算済み)
+と、サーバーが実際に受信したバイト列のハッシュ(パッチ済み)が食い違い、
+`Finished`メッセージの検証が失敗する。本物のREALITY(Xray-core)がGoの
+`crypto/tls`を丸ごとフォークしている理由はまさにこれで、uTLSは「トランス
+クリプトハッシュが計算される**前**に」ClientHelloへ認証情報を埋め込める。
+`rustls`の公開APIには同等のフック(ハッシュ計算前に生バイト列を差し替える
+手段)が無い。
+
+**解決策**: `session_id`への埋め込みをやめ、**`key_share`拡張のX25519公開鍵
+そのものをクライアントの固定識別子として使う**方式に設計変更した。
+`key_share`はClientHello構築時から一貫して使われる値であり、後から書き
+換える必要が無いため、トランスクリプトハッシュの問題を回避できる。
+
+- [`rustls::crypto::SupportedKxGroup`]/`ActiveKeyExchange`を自前実装
+  (`FixedX25519ActiveKeyExchange`/`FixedX25519KxGroup`、`cert_clone.rs`):
+  rustlsが本来ランダムに生成するエフェメラル鍵の代わりに、呼び出し側が
+  指定したX25519秘密鍵を使わせる。TLS1.3セッション自体の前方秘匿性は
+  損なわれない(サーバー側エフェメラル鍵は`rustls`が生成する通常の
+  ランダム値のまま)。
+- `reality_auth::AllowedClientKeys`(新設): 事前登録済みクライアント公開鍵
+  の許可リスト(`vless::AllowedUuids`と同じ設計)。`accept_and_route_cert_cloned`
+  は、`key_share`から読み取った公開鍵がこのリストに含まれるかどうかで
+  認証を判定する。
+- **既知のトレードオフ**: TLS1.3の`key_share`は本来エフェメラル(接続毎に
+  使い捨て)であるべきだが、この設計ではクライアントが固定の識別鍵を
+  繰り返し使うため、観測者が複数接続にわたってクライアントを追跡できて
+  しまう(プライバシー上の弱化)。`wireguard_handshake.rs`の`Peer`が既に
+  同種の固定長期鍵を使っているのと同じ設計判断であり、TLS1.3セッション
+  自体の前方秘匿性(サーバー側は毎回新規のエフェメラル鍵)は失われない。
+
+[`src/net.rs`](src/net.rs)に`accept_and_route_cert_cloned`/
+`handle_relay_session_cert_cloned`を追加(`handle_relay_session`を
+`TcpStream`固定から`AsyncRead + AsyncWrite`ジェネリックへ一般化し、
+`secure_channel`版と`cert_clone`版の両方で共通のVLESS中継ロジックを
+再利用)。
+
+`cargo test`で74テスト全通過。新規の
+`full_pipeline_cert_cloned_reality_auth_to_real_tls13_vless_relay`
+(本物の`rustls`クライアント+`FixedX25519`で固定したエフェメラル鍵→
+`accept_and_route_cert_cloned`の認証判定→本物の証明書チェーンを偽装先
+から借用したTLS 1.3ハンドシェイクの実際の完了→VLESSリクエストの解析→
+実際の宛先への中継、を一気通貫で確認)が正しく成功することを確認済み。
+
+**残る簡略化**: (1) 証明書チェーンの取得は接続毎にライブ接続(本物の
+Xray-coreのような`CacheManager`によるキャッシュは未実装、次フェーズ
+候補)、(2) `key_share`固定によるプライバシートレードオフ(上記)、
+(3) `Command::Udp`/`Mux`の`cert_clone`経由対応は未着手(`Command::Tcp`のみ)。

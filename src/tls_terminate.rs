@@ -59,7 +59,9 @@ pub fn build_client_connector(
 ) -> Result<TlsConnector, rustls::Error> {
     let mut roots = rustls::RootCertStore::empty();
     roots.add(trusted_cert).map_err(|e| {
-        rustls::Error::General(format!("failed to add self-signed cert as trusted root: {e}"))
+        rustls::Error::General(format!(
+            "failed to add self-signed cert as trusted root: {e}"
+        ))
     })?;
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)

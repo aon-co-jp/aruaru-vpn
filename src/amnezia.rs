@@ -59,7 +59,11 @@ pub fn plan_handshake_send_sequence(
     let size_range = (config.junk_max_size - config.junk_min_size) as f64;
 
     for i in 0..config.junk_packet_count as usize {
-        let r = junk_size_randoms.get(i).copied().unwrap_or(0.0).clamp(0.0, 0.999_999_999);
+        let r = junk_size_randoms
+            .get(i)
+            .copied()
+            .unwrap_or(0.0)
+            .clamp(0.0, 0.999_999_999);
         let size = config.junk_min_size as usize + (r * size_range) as usize;
         steps.push(SendStep::Junk { size });
     }
@@ -181,8 +185,7 @@ mod tests {
             junk_max_size: 60,
         };
         let real_message = b"pretend-this-is-a-wireguard-handshake-message".to_vec();
-        let sequence =
-            build_obfuscated_send_sequence(&config, &[0.1, 0.5, 0.9], &real_message);
+        let sequence = build_obfuscated_send_sequence(&config, &[0.1, 0.5, 0.9], &real_message);
 
         assert_eq!(sequence.len(), 4);
         let recovered = extract_real_handshake_message(&config, &sequence)
@@ -206,7 +209,7 @@ mod tests {
     /// 相手側に届いて処理できることをend-to-endで確認する。
     #[test]
     fn obfuscated_sequence_carries_a_real_wireguard_handshake_message() {
-        use crate::wireguard_handshake::{build_initiator, build_responder, Peer};
+        use crate::wireguard_handshake::{Peer, build_initiator, build_responder};
 
         let initiator_peer = Peer::generate().expect("keygen must succeed");
         let responder_peer = Peer::generate().expect("keygen must succeed");

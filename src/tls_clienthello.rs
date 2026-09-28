@@ -88,7 +88,8 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ParsedClientHello, ParseError
     // session_id: 1バイト長 + 可変長本体
     let session_id_len = *hs_body
         .get(cursor)
-        .ok_or(ParseError::Malformed("missing session_id length"))? as usize;
+        .ok_or(ParseError::Malformed("missing session_id length"))?
+        as usize;
     cursor += 1;
     if hs_body.len() < cursor + session_id_len {
         return Err(ParseError::Malformed("session_id truncated"));
@@ -132,6 +133,38 @@ pub fn parse_client_hello(record: &[u8]) -> Result<ParsedClientHello, ParseError
         session_id,
         x25519_key_share,
     })
+}
+
+/// `record`(1つの完全なTLSレコードに収まったClientHello)の`session_id`
+/// フィールドの**先頭`replacement.len()`バイトだけ**を、その場で
+/// `replacement`に上書きする(実装フェーズ15の`cert_clone`が、標準準拠の
+/// TLSクライアント〈`rustls`〉が生成した本物のClientHelloへREALITY認証タグ
+/// を後から埋め込むために使う)。session_idフィールドの長さが
+/// `replacement`より短い場合は何もせず`false`を返す。
+pub fn patch_session_id_prefix(record: &mut [u8], replacement: &[u8]) -> bool {
+    if record.len() < 5 || record[0] != TLS_HANDSHAKE_CONTENT_TYPE {
+        return false;
+    }
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    if record.len() < 5 + record_len || record_len < 4 {
+        return false;
+    }
+
+    // ハンドシェイクヘッダ(4バイト) + client_version(2) + random(32) = 38、
+    // その直後にsession_idの長さバイトがある(record内のオフセットは
+    // 5〈レコードヘッダ〉+38 = 43、session_id本体は44から)。
+    let session_id_len_offset = 5 + 38;
+    if record.len() <= session_id_len_offset {
+        return false;
+    }
+    let session_id_len = record[session_id_len_offset] as usize;
+    let session_id_start = session_id_len_offset + 1;
+    if session_id_len < replacement.len() || record.len() < session_id_start + session_id_len {
+        return false;
+    }
+
+    record[session_id_start..session_id_start + replacement.len()].copy_from_slice(replacement);
+    true
 }
 
 /// 拡張リストの中から指定した`extension_type`を探し、その拡張データ本体
@@ -338,5 +371,29 @@ mod tests {
         let record = build_client_hello(b"", "example.test");
         let parsed = parse_client_hello(&record).expect("valid ClientHello must parse");
         assert!(parsed.session_id.is_empty());
+    }
+
+    #[test]
+    fn patch_session_id_prefix_overwrites_only_the_leading_bytes() {
+        // 32バイトの標準的なlegacy_session_id(標準準拠のTLSクライアントが
+        // 生成するのと同じ長さ)を持つClientHelloを想定する。
+        let original_session_id = [0xAAu8; 32];
+        let mut record = build_client_hello(&original_session_id, "example.test");
+
+        let auth_tag = [0xBBu8; 16];
+        assert!(patch_session_id_prefix(&mut record, &auth_tag));
+
+        let parsed = parse_client_hello(&record).expect("patched ClientHello must still parse");
+        assert_eq!(&parsed.session_id[..16], &auth_tag);
+        // 末尾16バイトは元のランダムな値のまま(session_idの長さ自体は
+        // 変更していないため、レコード長・以降のオフセットに影響しない)。
+        assert_eq!(&parsed.session_id[16..], &original_session_id[16..]);
+    }
+
+    #[test]
+    fn patch_session_id_prefix_fails_when_session_id_too_short() {
+        let mut record = build_client_hello(b"short", "example.test");
+        let auth_tag = [0xCCu8; 16];
+        assert!(!patch_session_id_prefix(&mut record, &auth_tag));
     }
 }

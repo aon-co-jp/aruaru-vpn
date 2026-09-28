@@ -208,7 +208,10 @@ mod tests {
         assert_eq!(parsed.uuid, uuid);
         assert_eq!(parsed.command, Command::Tcp);
         assert_eq!(parsed.port, 443);
-        assert_eq!(parsed.address, Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34)));
+        assert_eq!(
+            parsed.address,
+            Address::Ipv4(Ipv4Addr::new(93, 184, 216, 34))
+        );
         assert_eq!(&data[parsed.header_len..], b"payload-bytes");
     }
 
@@ -241,7 +244,10 @@ mod tests {
     fn rejects_unknown_command() {
         let uuid = [0u8; 16];
         let data = build_request(0, uuid, 99, 1, &[1, 0, 0, 0, 0], b"");
-        assert_eq!(parse_request(&data), Err(VlessParseError::UnknownCommand(99)));
+        assert_eq!(
+            parse_request(&data),
+            Err(VlessParseError::UnknownCommand(99))
+        );
     }
 
     #[test]
