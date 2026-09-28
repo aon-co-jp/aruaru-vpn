@@ -1,5 +1,6 @@
 mod amnezia;
 mod integration;
+mod key_storage;
 mod net;
 mod reality;
 mod reality_auth;
