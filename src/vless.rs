@@ -16,6 +16,7 @@
 //! サーバー応答ヘッダは`[1B version][1B addons_len][addons_len B addons]`
 //! で、以降は転送データそのもの。
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 /// VLESSリクエストヘッダから読み取った、転送先の指定方法。
@@ -148,6 +149,32 @@ pub fn build_response_header(version: u8) -> Vec<u8> {
     vec![version, 0x00]
 }
 
+/// 許可されたクライアントUUID(利用者ごとの識別子)の集合。VLESSは
+/// REALITY/TLSの認証とは別に、リクエストヘッダ自身が持つUUIDで
+/// 「どの利用者か」を識別・検証する(実際のXray-coreと同じ二段構えの
+/// 認証: 外側の輸送路〈REALITY〉と、内側のプロトコル〈VLESSのUUID〉)。
+#[derive(Debug, Clone, Default)]
+pub struct AllowedUuids {
+    uuids: HashSet<[u8; 16]>,
+}
+
+impl AllowedUuids {
+    pub fn new(uuids: impl IntoIterator<Item = [u8; 16]>) -> Self {
+        Self {
+            uuids: uuids.into_iter().collect(),
+        }
+    }
+
+    pub fn is_allowed(&self, uuid: &[u8; 16]) -> bool {
+        self.uuids.contains(uuid)
+    }
+}
+
+/// リクエストが許可済みUUIDを提示しているかを検証する。
+pub fn validate_uuid(request: &VlessRequest, allowed: &AllowedUuids) -> bool {
+    allowed.is_allowed(&request.uuid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +263,35 @@ mod tests {
     fn response_header_has_version_and_zero_addons() {
         let header = build_response_header(0);
         assert_eq!(header, vec![0x00, 0x00]);
+    }
+
+    #[test]
+    fn validate_uuid_accepts_registered_client() {
+        let uuid = [42u8; 16];
+        let data = build_request(0, uuid, 1, 443, &[1, 1, 1, 1, 1], b"");
+        let request = parse_request(&data).unwrap();
+
+        let allowed = AllowedUuids::new([uuid]);
+        assert!(validate_uuid(&request, &allowed));
+    }
+
+    #[test]
+    fn validate_uuid_rejects_unregistered_client() {
+        let uuid = [42u8; 16];
+        let data = build_request(0, uuid, 1, 443, &[1, 1, 1, 1, 1], b"");
+        let request = parse_request(&data).unwrap();
+
+        let allowed = AllowedUuids::new([[99u8; 16]]);
+        assert!(!validate_uuid(&request, &allowed));
+    }
+
+    #[test]
+    fn validate_uuid_rejects_when_allow_list_is_empty() {
+        let uuid = [1u8; 16];
+        let data = build_request(0, uuid, 1, 443, &[1, 1, 1, 1, 1], b"");
+        let request = parse_request(&data).unwrap();
+
+        let allowed = AllowedUuids::default();
+        assert!(!validate_uuid(&request, &allowed));
     }
 }

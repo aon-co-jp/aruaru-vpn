@@ -95,6 +95,13 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+- **2026-09-28 実装フェーズ8完了**: [`src/vless.rs`](src/vless.rs)に
+  `AllowedUuids`/`validate_uuid`を追加し、VLESS自身のUUIDによる二段構え
+  認証(輸送路のREALITY/TLSとは別)を実装。`net.rs`の
+  `handle_relay_session`にUUID検証を組み込み(未登録UUIDは宛先接続前に
+  拒否)、`Command::Udp`の実処理(`relay_udp`)を追加して実UDPソケットでの
+  往復をend-to-endで確認。`Command::Mux`は引き続き未対応。`cargo test`で
+  58テスト全通過。
 - **2026-09-28 実装フェーズ6・7完了**: [`src/key_storage.rs`](src/key_storage.rs)
   で秘密鍵/公開鍵の保存先ドライブ/ディレクトリを利用者が任意に選択できる
   ようにした(`KeyStorageConfig`)。「保存先を平文メモに自動記録する」機能は

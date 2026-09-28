@@ -15,7 +15,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use crate::reality::{decide_from_client_hello_record_x25519, ConnectionAction};
 use crate::reality_auth::ServerIdentity;
-use crate::vless::{self, Address, VlessRequest};
+use crate::vless::{self, Address, AllowedUuids, Command, VlessRequest};
 
 /// TCP接続を1本受け付け、その最初のTLS ClientHelloレコードを読み取って
 /// REALITY判定を行い、
@@ -79,10 +79,18 @@ where
 /// 実TLS終端は次フェーズで統合する)。
 ///
 /// `dial_destination`は「宛先(IP/ドメイン+ポート)を受け取り、そこへの
-/// TCP接続を返す」関数。実運用では実際のインターネット上の宛先へ接続するが、
-/// テストではローカルのモックサーバーを使えるよう抽象化してある。
+/// TCP接続を返す」関数(`Command::Tcp`の場合のみ使う)。実運用では実際の
+/// インターネット上の宛先へ接続するが、テストではローカルのモック
+/// サーバーを使えるよう抽象化してある。
+///
+/// `allowed_uuids`は、VLESSリクエストが持つUUID(利用者ごとの識別子)の
+/// 許可リスト。REALITY/TLSの認証(輸送路レベル)とは別に、VLESS自身が
+/// 「どの利用者か」を検証する二段構えの認証(実際のXray-coreと同じ設計)。
+/// 許可されていないUUIDのリクエストは、宛先への接続を試みることなく
+/// エラーとして拒否する。
 pub async fn handle_relay_session<F, Fut>(
     mut client_stream: TcpStream,
+    allowed_uuids: &AllowedUuids,
     dial_destination: F,
 ) -> std::io::Result<()>
 where
@@ -93,27 +101,87 @@ where
     let n = client_stream.read(&mut buf).await?;
     let data = &buf[..n];
 
+    let request = vless::parse_request(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+
+    if !vless::validate_uuid(&request, allowed_uuids) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "VLESS request presented an unregistered UUID",
+        ));
+    }
+
     let VlessRequest {
         version,
+        command,
         address,
         port,
         header_len,
         ..
-    } = vless::parse_request(data).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
-    })?;
+    } = request;
 
-    let mut destination_stream = dial_destination(address, port).await?;
+    let leftover_payload = if header_len < data.len() {
+        data[header_len..].to_vec()
+    } else {
+        Vec::new()
+    };
 
-    // サーバー応答ヘッダを先にクライアントへ返してから、リクエストヘッダに
-    // 続いていた実データ(あれば)を宛先へ転送し、以降は双方向に中継する。
     client_stream
         .write_all(&vless::build_response_header(version))
         .await?;
-    if header_len < data.len() {
-        destination_stream.write_all(&data[header_len..]).await?;
+
+    match command {
+        Command::Tcp => {
+            let mut destination_stream = dial_destination(address, port).await?;
+            if !leftover_payload.is_empty() {
+                destination_stream.write_all(&leftover_payload).await?;
+            }
+            tokio::io::copy_bidirectional(&mut client_stream, &mut destination_stream).await?;
+            Ok(())
+        }
+        Command::Udp => relay_udp(client_stream, address, port, leftover_payload).await,
+        Command::Mux => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "MUX command is not implemented yet",
+        )),
     }
-    tokio::io::copy_bidirectional(&mut client_stream, &mut destination_stream).await?;
+}
+
+/// VLESS `Command::Udp`の最小実装: 実際のUDPソケットで宛先とやり取りする。
+///
+/// **簡略化**: 本来のVLESS UDPは各データグラムに2バイトの長さプレフィックス
+/// を付けてTCP上で運ぶ(1本のTCP接続の中に複数のUDPパケットを表現する)
+/// フレーミング方式を使うが、ここでは「クライアントからの最初のペイロードを
+/// 1個のUDPデータグラムとして送り、宛先からの応答をクライアントへそのまま
+/// 返す」という往復1回分の最小疎通確認に留める(複数データグラムの
+/// フレーミングは次フェーズ)。
+async fn relay_udp(
+    mut client_stream: TcpStream,
+    address: Address,
+    port: u16,
+    initial_payload: Vec<u8>,
+) -> std::io::Result<()> {
+    let destination = match address {
+        Address::Ipv4(ip) => (std::net::IpAddr::V4(ip), port).into(),
+        Address::Ipv6(ip) => (std::net::IpAddr::V6(ip), port).into(),
+        Address::Domain(domain) => {
+            let mut addrs = tokio::net::lookup_host((domain.as_str(), port)).await?;
+            addrs.next().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "domain resolved to no address")
+            })?
+        }
+    };
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    udp_socket.connect(destination).await?;
+
+    if !initial_payload.is_empty() {
+        udp_socket.send(&initial_payload).await?;
+    }
+
+    let mut response_buf = [0u8; 65536];
+    let n = udp_socket.recv(&mut response_buf).await?;
+    client_stream.write_all(&response_buf[..n]).await?;
     Ok(())
 }
 
@@ -269,9 +337,11 @@ mod tests {
         let relay_addr = relay_listener.local_addr().unwrap();
 
         let destination_port = destination_addr.port();
+        let allowed_uuid = [7u8; 16];
         let server_task = tokio::spawn(async move {
             let (server_side_stream, _) = relay_listener.accept().await.unwrap();
-            handle_relay_session(server_side_stream, |address, port| async move {
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session(server_side_stream, &allowed, |address, port| async move {
                 assert_eq!(port, destination_port);
                 match address {
                     Address::Domain(d) if d == "127.0.0.1" => {
@@ -287,7 +357,7 @@ mod tests {
 
         let mut vless_request = Vec::new();
         vless_request.push(0u8); // version
-        vless_request.extend_from_slice(&[0u8; 16]); // uuid (未検証、次フェーズ)
+        vless_request.extend_from_slice(&allowed_uuid); // 許可リストに登録済みのUUID
         vless_request.push(0u8); // addons_len = 0
         vless_request.push(1u8); // command = TCP
         vless_request.extend_from_slice(&destination_port.to_be_bytes());
@@ -310,6 +380,92 @@ mod tests {
         assert_eq!(echoed, b"payload-through-vless");
 
         client.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// 許可リストに無いUUIDを提示したVLESSリクエストは、宛先への接続を
+    /// 試みることなく拒否されることを確認する。
+    #[tokio::test]
+    async fn relay_session_rejects_unregistered_uuid_without_dialing_destination() {
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (server_side_stream, _) = relay_listener.accept().await.unwrap();
+            let allowed = AllowedUuids::new([[1u8; 16]]); // クライアントは[2u8;16]を使う
+            handle_relay_session(server_side_stream, &allowed, |_address, _port| async {
+                panic!("destination dialer must not be called for an unregistered UUID")
+            })
+            .await
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&[2u8; 16]); // 許可リストに無いUUID
+        vless_request.push(0u8);
+        vless_request.push(1u8); // command = TCP
+        vless_request.extend_from_slice(&443u16.to_be_bytes());
+        vless_request.push(1u8); // address_type = IPv4
+        vless_request.extend_from_slice(&[1, 1, 1, 1]);
+        client.write_all(&vless_request).await.unwrap();
+
+        let result = server_task.await.unwrap();
+        assert!(result.is_err(), "unregistered UUID must be rejected");
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+    }
+
+    /// VLESS `Command::Udp`が、実際のUDPソケットで宛先(モックのUDP echo
+    /// サーバー)まで往復できることを確認する。
+    #[tokio::test]
+    async fn relay_session_forwards_udp_command_to_real_destination() {
+        // 宛先役: 受け取ったUDPデータグラムをそのまま送り返すechoサーバー。
+        let udp_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_destination_addr = udp_destination.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            if let Ok((n, from)) = udp_destination.recv_from(&mut buf).await {
+                let _ = udp_destination.send_to(&buf[..n], from).await;
+            }
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let allowed_uuid = [3u8; 16];
+        let destination_port = udp_destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let (server_side_stream, _) = relay_listener.accept().await.unwrap();
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session(server_side_stream, &allowed, |_address, _port| async {
+                panic!("TCP dialer must not be called for a UDP command")
+            })
+            .await
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&allowed_uuid);
+        vless_request.push(0u8);
+        vless_request.push(2u8); // command = UDP
+        vless_request.extend_from_slice(&destination_port.to_be_bytes());
+        vless_request.push(1u8); // address_type = IPv4
+        vless_request.extend_from_slice(&[127, 0, 0, 1]);
+        vless_request.extend_from_slice(b"udp-payload");
+        client.write_all(&vless_request).await.unwrap();
+
+        let mut response_header = [0u8; 2];
+        client.read_exact(&mut response_header).await.unwrap();
+        assert_eq!(response_header, [0u8, 0u8]);
+
+        let mut echoed = vec![0u8; b"udp-payload".len()];
+        client.read_exact(&mut echoed).await.unwrap();
+        assert_eq!(echoed, b"udp-payload");
+
         server_task.await.unwrap().unwrap();
     }
 
