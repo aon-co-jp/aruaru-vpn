@@ -95,6 +95,24 @@ GPU高速化)・`open-directx`(クライアント管理UIの高速描画、open-
 
 ## HANDOFF
 
+**🛑 再開用メッセージ(次回このセッションを続ける人へ、2026-09-28時点)**:
+実装フェーズ10まで完了・push済み(コミット`684de51`)。`cargo test`で
+65テスト全通過(フルパイプラインのend-to-endテスト`full_pipeline_reality_auth_to_encrypted_vless_relay`含む)。
+現在の到達点: REALITY認証(X25519 ECDH)→[`src/secure_channel.rs`](src/secure_channel.rs)
+(自前AEAD暗号化レコード層、ChaCha20-Poly1305/HKDFは監査済みcrateに委任)
+→VLESS UUID検証→実TCP中継、までが実際に配線され動作確認済み。未着手・
+既知の制約(優先度順ではなく列挙、着手前に必ずユーザーに確認すること):
+(1) `secure_channel`経由の`Command::Udp`/`Command::Mux`対応(現状UDPは
+旧来の平文`handle_relay_session`側のみ対応)、(2) REALITY本来の証明書
+クローン(偽装先サイトの本物証明書の流用、`session_id`埋め込み設計と
+根本的に相性が悪いことが判明済み)、(3) 将来のTLS 1.3完全準拠・
+「TLS 1.4」的な将来動向(いずれもアイデア・方向性の域を出ず、実装着手の
+判断は都度の技術動向・必要性を見て行う、`PORTING.md`「20.」のロードマップ
+参照)、(4) 配布形態・鍵管理UI(ファイルピッカー等)の詳細、(5) 透明性
+告知文の翻訳ネイティブ検証。次回はまずユーザーに「次はどの方向へ進めるか」
+(UDP/MUX拡張か、TLS 1.3準拠調査か、それとも配布・UI整備か)を確認してから
+着手すること(このセッション内でユーザーから明示的に指示された)。
+
 - **2026-09-28 実装フェーズ10完了(独自セキュアトランスポート+実配線、
   致命的バグ2件を発見・修正)**: `rustls`ベースのTLS終端を実配線しようと
   したところ、私たちのREALITY認証(ClientHelloの`session_id`欄への
