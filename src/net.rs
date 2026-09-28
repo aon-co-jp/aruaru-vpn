@@ -197,7 +197,7 @@ where
     }
 }
 
-/// [`handle_relay_session`]の暗号化版(実装フェーズ10): REALITY認証で
+/// [`handle_relay_session`]の暗号化版(実装フェーズ10・11): REALITY認証で
 /// 確立済みの`ChannelKeys`を使い、[`secure_channel`]で実際に暗号化された
 /// 通信路の中でVLESSセッションを処理する。
 ///
@@ -206,7 +206,8 @@ where
 /// 参照)。クライアントは最初の1メッセージとして「VLESSリクエストヘッダ+
 /// (あれば)先頭ペイロード」をまとめて送ってくる前提。
 ///
-/// **現時点のスコープ**: `Command::Tcp`のみ対応(`Udp`/`Mux`は次フェーズ)。
+/// **現時点のスコープ**: `Command::Tcp`/`Command::Udp`に対応
+/// (`Mux`は引き続き未対応、`PORTING.md`「20.」参照)。
 pub async fn handle_relay_session_secure<F, Fut>(
     client_stream: TcpStream,
     channel_keys: &ChannelKeys,
@@ -239,38 +240,114 @@ where
         ..
     } = request;
 
-    if command != Command::Tcp {
-        return Err(std::io::Error::new(
+    let leftover_payload = first_message[header_len..].to_vec();
+
+    match command {
+        Command::Tcp => {
+            let mut destination_stream = dial_destination(address, port).await?;
+            if !leftover_payload.is_empty() {
+                destination_stream.write_all(&leftover_payload).await?;
+            }
+            writer.send(&vless::build_response_header(version)).await?;
+
+            // secure_channelは「暗号化フレーム単位」、destination_streamは
+            // 「生のバイトストリーム」なので、`copy_bidirectional`は使えない。
+            // 双方向を手動でポンピングする最小限のループ。
+            let mut dest_buf = vec![0u8; 8192];
+            loop {
+                tokio::select! {
+                    from_client = reader.recv() => {
+                        match from_client {
+                            Ok(plaintext) => destination_stream.write_all(&plaintext).await?,
+                            Err(_) => break, // クライアント側の終了(EOF/エラー)とみなす
+                        }
+                    }
+                    from_dest = destination_stream.read(&mut dest_buf) => {
+                        let n = from_dest?;
+                        if n == 0 {
+                            break; // 宛先側がクローズ
+                        }
+                        writer.send(&dest_buf[..n]).await?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Udp => {
+            relay_udp_secure(&mut writer, &mut reader, address, port, leftover_payload, version)
+                .await
+        }
+        Command::Mux => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
-            "only Command::Tcp is implemented over the encrypted secure_channel so far",
-        ));
+            "MUX command is not implemented yet",
+        )),
+    }
+}
+
+/// [`relay_udp`]の暗号化版(実装フェーズ11): クライアント⇔サーバー間は
+/// [`secure_channel`]の暗号化フレーム単位でやり取りしつつ、サーバー⇔
+/// 実際の宛先の間は生のUDPデータグラムで中継する。
+///
+/// **フレーミング**: 平文版(`relay_udp`)と同じく、クライアントからの
+/// 最初のペイロードを1個のUDPデータグラムとして送り、宛先からの応答を
+/// 折り返すという往復1回分の最小疎通確認に留める(複数データグラムの
+/// 継続的なやり取りは次フェーズ)。`secure_channel`のメッセージ境界が
+/// そのままUDPデータグラム境界に対応するため、追加の長さプレフィックスは
+/// 不要(TCP版のVLESS UDPが必要とする2バイト長プレフィックスは、暗号化
+/// フレーム自体が既にメッセージ境界を保持しているため省略している)。
+async fn relay_udp_secure<W, R>(
+    writer: &mut secure_channel::SecureWriter<W>,
+    reader: &mut secure_channel::SecureReader<R>,
+    address: Address,
+    port: u16,
+    initial_payload: Vec<u8>,
+    response_version: u8,
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let destination = match address {
+        Address::Ipv4(ip) => (std::net::IpAddr::V4(ip), port).into(),
+        Address::Ipv6(ip) => (std::net::IpAddr::V6(ip), port).into(),
+        Address::Domain(domain) => {
+            let mut addrs = tokio::net::lookup_host((domain.as_str(), port)).await?;
+            addrs.next().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "domain resolved to no address")
+            })?
+        }
+    };
+
+    let udp_socket = UdpSocket::bind("0.0.0.0:0").await?;
+    udp_socket.connect(destination).await?;
+
+    writer
+        .send(&vless::build_response_header(response_version))
+        .await?;
+
+    if !initial_payload.is_empty() {
+        udp_socket.send(&initial_payload).await?;
     }
 
-    let leftover_payload = &first_message[header_len..];
-    let mut destination_stream = dial_destination(address, port).await?;
-    if !leftover_payload.is_empty() {
-        destination_stream.write_all(leftover_payload).await?;
-    }
-    writer.send(&vless::build_response_header(version)).await?;
-
-    // secure_channelは「暗号化フレーム単位」、destination_streamは
-    // 「生のバイトストリーム」なので、`copy_bidirectional`は使えない。
-    // 双方向を手動でポンピングする最小限のループ。
-    let mut dest_buf = vec![0u8; 8192];
+    // クライアント→宛先、宛先→クライアントの両方向を、それぞれが
+    // クローズ/エラーになるまでポンピングし続ける(平文版は往復1回で
+    // 打ち切っていたが、`secure_channel`のメッセージ単位フレーミングは
+    // 継続的なデータグラムのやり取りにそのまま拡張できるため、ここでは
+    // 複数データグラムに対応する)。
+    let mut dest_buf = [0u8; 65536];
     loop {
         tokio::select! {
             from_client = reader.recv() => {
                 match from_client {
-                    Ok(plaintext) => destination_stream.write_all(&plaintext).await?,
-                    Err(_) => break, // クライアント側の終了(EOF/エラー)とみなす
+                    Ok(datagram) => { udp_socket.send(&datagram).await?; }
+                    Err(_) => break,
                 }
             }
-            from_dest = destination_stream.read(&mut dest_buf) => {
+            from_dest = udp_socket.recv(&mut dest_buf) => {
                 let n = from_dest?;
-                if n == 0 {
-                    break; // 宛先側がクローズ
+                if writer.send(&dest_buf[..n]).await.is_err() {
+                    break;
                 }
-                writer.send(&dest_buf[..n]).await?;
             }
         }
     }
@@ -596,6 +673,100 @@ mod tests {
         client.read_exact(&mut echoed).await.unwrap();
         assert_eq!(echoed, b"udp-payload");
 
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// VLESS `Command::Udp`が、`secure_channel`で暗号化された通信路越しでも
+    /// 実際のUDPソケットで宛先(モックのUDP echoサーバー)まで複数回往復
+    /// できることを確認する(実装フェーズ11)。
+    #[tokio::test]
+    async fn relay_session_secure_forwards_udp_command_to_real_destination() {
+        use crate::reality_auth::ClientEphemeralKeypair;
+
+        // 宛先役: 受け取ったUDPデータグラムをそのまま送り返すechoサーバー
+        // (複数回の往復に対応)。
+        let udp_destination = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let udp_destination_addr = udp_destination.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            loop {
+                match udp_destination.recv_from(&mut buf).await {
+                    Ok((n, from)) => {
+                        let _ = udp_destination.send_to(&buf[..n], from).await;
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let identity = Arc::new(ServerIdentity::generate([60u8; 32]));
+        let client_ephemeral = ClientEphemeralKeypair::generate([61u8; 32]);
+        let auth_tag = client_ephemeral.derive_auth_tag(&identity.public_key());
+        let allowed_uuid = [9u8; 16];
+
+        let reality_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reality_addr = reality_listener.local_addr().unwrap();
+        let identity_for_server = Arc::clone(&identity);
+        let destination_port = udp_destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let authenticated =
+                accept_and_route(&reality_listener, identity_for_server, |_| async {
+                    panic!("this test's client must always authenticate; camouflage path unused")
+                })
+                .await
+                .unwrap()
+                .expect("client must authenticate via REALITY");
+
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session_secure(
+                authenticated.stream,
+                &authenticated.channel_keys,
+                &allowed,
+                |_address, _port| async {
+                    panic!("TCP dialer must not be called for a UDP command")
+                },
+            )
+            .await
+        });
+
+        let mut client_tcp = TcpStream::connect(reality_addr).await.unwrap();
+        let client_hello = build_client_hello_with_key_share_for_tests(
+            &auth_tag,
+            "www.microsoft.com",
+            &client_ephemeral.public_key().to_bytes(),
+        );
+        client_tcp.write_all(&client_hello).await.unwrap();
+
+        let client_channel_keys = client_ephemeral.derive_channel_keys(&identity.public_key());
+        let (mut writer, mut reader) =
+            secure_channel::initiator_channel(client_tcp, &client_channel_keys);
+
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&allowed_uuid);
+        vless_request.push(0u8); // addons_len = 0
+        vless_request.push(2u8); // command = UDP
+        vless_request.extend_from_slice(&destination_port.to_be_bytes());
+        vless_request.push(1u8); // address_type = IPv4
+        vless_request.extend_from_slice(&[127, 0, 0, 1]);
+        vless_request.extend_from_slice(b"udp-datagram-one");
+
+        writer.send(&vless_request).await.unwrap();
+
+        let response_header = reader.recv().await.unwrap();
+        assert_eq!(response_header, vec![0u8, 0u8]);
+
+        let echoed_one = reader.recv().await.unwrap();
+        assert_eq!(echoed_one, b"udp-datagram-one");
+
+        // 2個目のデータグラムも、同じ暗号化フレームのやり取りで往復できる
+        // (複数データグラム対応、平文版〈TCP埋め込みの1往復限定〉との差分)。
+        writer.send(b"udp-datagram-two").await.unwrap();
+        let echoed_two = reader.recv().await.unwrap();
+        assert_eq!(echoed_two, b"udp-datagram-two");
+
+        writer.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
     }
 
