@@ -1,18 +1,8 @@
-mod amnezia;
-mod integration;
-mod key_storage;
-mod net;
-mod reality;
-mod reality_auth;
-mod secure_channel;
-mod tls_clienthello;
-mod tls_terminate;
-mod vless;
-mod wireguard_handshake;
-
-use amnezia::{plan_handshake_send_sequence, ObfuscationConfig};
-use integration::{CpuOnlyCryptoAccelerator, CryptoAccelerator, NoOpTrafficShaper, TrafficShaper};
-use reality::{decide_connection_action, ConnectionAction, RealityAuthChecker};
+use aruaru_vpn::amnezia::{plan_handshake_send_sequence, ObfuscationConfig};
+use aruaru_vpn::integration::{
+    CpuOnlyCryptoAccelerator, CryptoAccelerator, NoOpTrafficShaper, TrafficShaper,
+};
+use aruaru_vpn::reality::{decide_connection_action, ConnectionAction, RealityAuthChecker};
 
 fn main() {
     let checker = RealityAuthChecker::new([b"example-short-id".to_vec()]);
