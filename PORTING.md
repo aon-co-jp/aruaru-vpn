@@ -738,3 +738,47 @@ end-to-endテスト1件+`net.rs`統合テスト2件〈平文版・`secure_channe
 **残る制約**: `secure_channel`版`handle_relay_session_secure`のCommand::Mux
 実配線で、VLESS応答ヘッダの送信漏れ(`Command::Tcp`/`Udp`は個別に送信して
 いたが、`Mux`だけ送信し忘れていた)という統合バグも同時に発見・修正した。
+
+## 28. 実装フェーズ18(完了・2026-09-30): ブラウザTLS指紋偽装(uTLS相当、部分的)+RPoemへの共通ライブラリ化
+
+ユーザーから「uTLSのようなブラウザ指紋偽装は未実装」との指摘を受け、実装に
+着手した。
+
+**調査**: [craftls](https://github.com/3andne/craftls)というrustlsのフォーク
+(GREASE・拡張permutation・`CHROME_108`等の完全なプリセットを持つ)を発見し、
+`[patch.crates-io]`での採用を試みたが、(1)クレート名が`craftls`
+(`[lib] name = "rustls"`という食い違いがあり、Cargoのpatch機構が要求する
+「パッチ元と同じパッケージ名」を満たせない)、(2)対応バージョンが0.22系
+のみでこのリポジトリの`rustls 0.23.45`とは互換性が無い(パッチのバージョン
+要求を満たせない)、という2つの理由で採用を断念した。
+
+**実装した範囲**: `rustls`の公開APIだけで実現できる部分的な指紋偽装:
+- 暗号スイートの優先順序をChromeに合わせる(AES-128が最優先、`rustls`標準
+  はAES-256が最優先で順序が逆)。
+- `supported_groups`拡張に、REALITY認証のために固定する鍵交換グループに
+  加えて、Chromeが通常提示するsecp256r1/secp384r1を追加(これらには実際の
+  鍵共有は送らない、`key_share`は最優先グループのみに載るため認証への影響
+  なし)。
+- `signature_algorithms`拡張のスキーム一覧を、ED25519のみ(検閲装置の強い
+  シグナルになっていた)から、Chromeが提示する8〜9種類の一覧に拡張。
+- ALPNプロトコルリストを`h2`/`http/1.1`に設定。
+
+**実現できない範囲(正直に明記)**: 拡張の並び順そのものの並べ替えや
+GREASE値(RFC 8701)の挿入は、`rustls`が公開APIとして提供していないため
+実現できない。将来`craftls`が0.23系に追従するか、同等の機能が`rustls`本体
+に取り込まれれば再検討の価値がある。
+
+**RPoemへの切り出し**: ユーザーから「今回の関連の開発でライブラリ化・
+フレームワーク化した方がメリットがある部分は、今後もRPoemに組み込む」との
+恒久方針が示されたため、上記の実装を`F:\RPoem`(aon-co-jp共通ワークスペース)
+に新設した[`open-runo-tls-fingerprint`](https://github.com/aon-co-jp/RPoem/tree/main/crates/open-runo-tls-fingerprint)
+クレートへ切り出し、`aruaru-vpn`側は`cert_clone.rs`からこのcrateをgit依存
+として参照する形に変更した(`FixedX25519KxGroup`・`chrome_tls13_cipher_suites`・
+`chrome_signature_schemes`・`chrome_alpn_protocols`・`apply_chrome_fingerprint`)。
+他プロジェクトでも同様のTLSクライアント指紋偽装が必要になった場合に再利用
+できる。
+
+`cargo test`で84テスト全通過(新規1: 実際に送信されるClientHelloの生バイト列
+を検査し、AES-128がAES-256より先に現れること・ALPNに`h2`が含まれることを
+確認するend-to-endテスト)。RPoem側の`open-runo-tls-fingerprint`クレート自体も
+7テスト全通過、ワークスペース全体の`cargo check`も成功を確認。

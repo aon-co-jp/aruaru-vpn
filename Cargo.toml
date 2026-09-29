@@ -14,6 +14,7 @@ egui = "0.32"
 hmac = "0.13.0"
 rfd = "0.16.0"
 hkdf = "0.13.0"
+open-runo-tls-fingerprint = { git = "https://github.com/aon-co-jp/RPoem.git", package = "open-runo-tls-fingerprint" }
 rand = "0.10.3"
 rand_core = "0.10.1"
 rcgen = "0.14.10"

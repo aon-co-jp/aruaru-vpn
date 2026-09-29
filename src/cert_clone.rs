@@ -347,7 +347,7 @@ impl ServerCertVerifier for AuthKeyVerifier {
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![CERT_CLONE_SIGNATURE_SCHEME]
+        open_runo_tls_fingerprint::chrome_signature_schemes()
     }
 
     fn root_hint_subjects(&self) -> Option<&[DistinguishedName]> {
@@ -376,96 +376,27 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 /// (下記のドキュメント参照)。この関数は`cert_clone`単体のTLS
 /// ハンドシェイク自体の正しさを確認するテスト用。
 pub fn build_cloned_client_connector(auth_key: [u8; 64]) -> TlsConnector {
-    let config = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+    let mut provider = rustls::crypto::aws_lc_rs::default_provider();
+    provider.cipher_suites =
+        open_runo_tls_fingerprint::chrome_tls13_cipher_suites(&provider.cipher_suites);
+
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("TLS 1.3 is supported by the aws_lc_rs provider")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AuthKeyVerifier { auth_key }))
         .with_no_client_auth();
+    config.alpn_protocols = open_runo_tls_fingerprint::chrome_alpn_protocols();
     TlsConnector::from(Arc::new(config))
 }
 
-/// [`rustls::crypto::ActiveKeyExchange`]の自前実装(実装フェーズ16):
-/// rustlsが生成するランダムなエフェメラル鍵の代わりに、
-/// **REALITY認証のエフェメラル鍵(`reality_auth::ClientEphemeralKeypair`)を
-/// そのままTLSの鍵交換にも使う**。
-///
-/// **これが必要な理由**: `accept_and_route_cert_cloned`は、ClientHelloの
-/// `key_share`拡張からクライアントのX25519公開鍵を読み取り、それに対して
-/// `ServerIdentity::derive_auth_tag`/`derive_cert_clone_auth_key`を計算して
-/// REALITY認証を判定する。rustls標準のTLSクライアントは`key_share`に
-/// **ランダムに生成した使い捨てのエフェメラル鍵**を使うため、そのままでは
-/// サーバー側が「どの秘密鍵とペアなのか」を知りようがなく、REALITY認証の
-/// 計算(ECDH)ができない。そこで、TLSの鍵交換自体に**呼び出し側が指定した
-/// 特定のX25519秘密鍵**を使わせることで、`key_share`に載る公開鍵が
-/// `ClientEphemeralKeypair::public_key()`と一致するようにする。
-///
-/// TLS 1.3セッション自体の前方秘匿性は損なわれない(サーバー側のTLS
-/// エフェメラル鍵は`rustls`が生成する通常のランダム値のまま、ECDHE鍵交換
-/// 自体は毎回異なる組み合わせになる)。REALITY認証はこの鍵交換とは別に、
-/// 同じクライアント公開鍵を使って「サーバーの**長期**識別鍵」との間で
-/// 独立にECDHを行う側面計算に過ぎない(本物のREALITYと同じ設計、
-/// `PORTING.md`「25.」参照)。
-struct FixedX25519ActiveKeyExchange {
-    secret: x25519_dalek::StaticSecret,
-    public: x25519_dalek::PublicKey,
-}
-
-impl std::fmt::Debug for FixedX25519ActiveKeyExchange {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("FixedX25519ActiveKeyExchange")
-            .finish_non_exhaustive()
-    }
-}
-
-impl rustls::crypto::ActiveKeyExchange for FixedX25519ActiveKeyExchange {
-    fn complete(
-        self: Box<Self>,
-        peer_pub_key: &[u8],
-    ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
-        let peer_bytes: [u8; 32] = peer_pub_key.try_into().map_err(|_| {
-            rustls::Error::General(
-                "aruaru-vpn cert_clone: malformed X25519 peer public key".to_owned(),
-            )
-        })?;
-        let shared = self
-            .secret
-            .diffie_hellman(&x25519_dalek::PublicKey::from(peer_bytes));
-        Ok(rustls::crypto::SharedSecret::from(
-            shared.as_bytes().as_slice(),
-        ))
-    }
-
-    fn pub_key(&self) -> &[u8] {
-        self.public.as_bytes()
-    }
-
-    fn group(&self) -> rustls::NamedGroup {
-        rustls::NamedGroup::X25519
-    }
-}
-
-#[derive(Debug)]
-struct FixedX25519KxGroup {
-    seed: [u8; 32],
-}
-
-impl rustls::crypto::SupportedKxGroup for FixedX25519KxGroup {
-    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-        let secret = x25519_dalek::StaticSecret::from(self.seed);
-        let public = x25519_dalek::PublicKey::from(&secret);
-        Ok(Box::new(FixedX25519ActiveKeyExchange { secret, public }))
-    }
-
-    fn name(&self) -> rustls::NamedGroup {
-        rustls::NamedGroup::X25519
-    }
-}
-
-/// [`build_cloned_client_connector`]の、実運用向けの版(実装フェーズ16):
+/// [`build_cloned_client_connector`]の、実運用向けの版(実装フェーズ16、
+/// 実装フェーズ18で[`open_runo_tls_fingerprint`]クレートへ切り出し):
 /// `ephemeral_seed`(REALITY認証の`ClientEphemeralKeypair::generate`に渡した
 /// のと同じシード)をTLSの鍵交換自体にも使わせることで、サーバー側の
 /// `accept_and_route_cert_cloned`が`key_share`から読み取る公開鍵と、
 /// REALITY認証で使うエフェメラル公開鍵が一致するようにする
-/// (`FixedX25519ActiveKeyExchange`のドキュメント参照)。
+/// ([`open_runo_tls_fingerprint::FixedX25519KxGroup`]のドキュメント参照)。
 ///
 /// 呼び出す側は、`ephemeral_seed`から作った公開鍵を事前に
 /// `reality_auth::AllowedClientKeys`へ登録しておく必要がある(サーバー側が
@@ -476,17 +407,25 @@ pub fn build_cloned_client_connector_with_reality_ephemeral(
     ephemeral_seed: [u8; 32],
 ) -> TlsConnector {
     let mut provider = rustls::crypto::aws_lc_rs::default_provider();
-    let kx_group: &'static FixedX25519KxGroup = Box::leak(Box::new(FixedX25519KxGroup {
-        seed: ephemeral_seed,
-    }));
-    provider.kx_groups = vec![kx_group];
+    let kx_group: &'static open_runo_tls_fingerprint::FixedX25519KxGroup = Box::leak(Box::new(
+        open_runo_tls_fingerprint::FixedX25519KxGroup::new(ephemeral_seed),
+    ));
+    open_runo_tls_fingerprint::apply_chrome_fingerprint(
+        &mut provider,
+        kx_group,
+        &[
+            rustls::crypto::aws_lc_rs::kx_group::SECP256R1,
+            rustls::crypto::aws_lc_rs::kx_group::SECP384R1,
+        ],
+    );
 
-    let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("TLS 1.3 is supported by the aws_lc_rs provider with an X25519 kx group")
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AuthKeyVerifier { auth_key }))
         .with_no_client_auth();
+    config.alpn_protocols = open_runo_tls_fingerprint::chrome_alpn_protocols();
     TlsConnector::from(Arc::new(config))
 }
 
@@ -648,5 +587,62 @@ mod tests {
         let result = client_connector.connect(server_name, tcp).await;
 
         assert!(result.is_err(), "wrong AuthKey must fail the handshake");
+    }
+
+    /// ブラウザ指紋偽装(実装フェーズ18)が実際にワイヤー上のバイト列に
+    /// 反映されていることを、生のClientHelloレコードを直接検査して確認
+    /// する(「動いた」だけでなく「本当に狙った変更が乗っているか」の
+    /// 検証)。
+    #[tokio::test]
+    async fn client_hello_reflects_chrome_like_fingerprint_on_the_wire() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_task = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            // レコードヘッダ(5B)+ハンドシェイクヘッダ(4B)+
+            // client_version(2B)+random(32B)+session_id長(1B)まで読み、
+            // 残りは可変長なので十分大きめに読み取る。
+            let mut buf = vec![0u8; 4096];
+            let n = tcp.read(&mut buf).await.unwrap();
+            buf.truncate(n);
+            buf
+        });
+
+        let ephemeral_seed = [200u8; 32];
+        let auth_key = [0u8; 64]; // このテストではハンドシェイク完走までは求めない
+        let connector =
+            build_cloned_client_connector_with_reality_ephemeral(auth_key, ephemeral_seed);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("example.test").unwrap();
+        // サーバー側が本物のTLSサーバーではないため、この接続自体はいずれ
+        // 失敗する(ハンドシェイクは完走しない)。ここで見たいのは
+        // 「送信されたClientHelloの生バイト列」だけなので結果は無視する。
+        let _ = connector.connect(server_name, tcp).await;
+
+        let record = server_task.await.unwrap();
+        assert_eq!(record[0], 0x16, "must be a TLS handshake record");
+
+        // 暗号スイート一覧の中で、TLS13_AES_128_GCM_SHA256(0x1301)が
+        // TLS13_AES_256_GCM_SHA384(0x1302)より先に現れること
+        // (Chromeの優先順、rustls標準は逆順)。
+        let pos_128 = find_subsequence(&record, &[0x13, 0x01]).expect("0x1301 must be present");
+        let pos_256 = find_subsequence(&record, &[0x13, 0x02]).expect("0x1302 must be present");
+        assert!(
+            pos_128 < pos_256,
+            "AES-128 (Chrome's top preference) must appear before AES-256"
+        );
+
+        // ALPNプロトコルリストに"h2"が含まれること。
+        assert!(
+            find_subsequence(&record, b"h2").is_some(),
+            "ALPN extension must offer h2"
+        );
+    }
+
+    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack
+            .windows(needle.len())
+            .position(|window| window == needle)
     }
 }

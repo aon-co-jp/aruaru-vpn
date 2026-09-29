@@ -144,7 +144,7 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
 
 ## 現在の到達点
 
-2026-09-29時点(実装フェーズ17完了、`cargo test`で83テスト全通過):
+2026-09-30時点(実装フェーズ18完了、`cargo test`で84テスト全通過):
 
 - REALITY認証(X25519 ECDH)→本物の証明書チェーンを偽装先サイトから
   実際に借用したTLS 1.3ハンドシェイク(`cert_clone`、
@@ -152,6 +152,11 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
   フォークせず実装、証明書チェーンはTTL付きキャッシュを使用)→VLESS UUID
   検証→実TCP/UDP/Mux中継、まで実配線・動作確認済み(本物の`rustls`
   クライアントを使ったフルパイプラインend-to-endテストが実際に成功)。
+- ブラウザTLS指紋偽装(uTLS相当、部分的): 暗号スイート順序・鍵交換グループ・
+  ALPN・署名アルゴリズム一覧をChromeに寄せる(`rustls`の公開APIの限界内、
+  拡張の並び順・GREASEは未実現)。[RPoem](https://github.com/aon-co-jp/RPoem)
+  の`open-runo-tls-fingerprint`crateとして共通ライブラリ化し、他プロジェクト
+  からも再利用可能。
 - `Command::Mux`([`src/mux.rs`](src/mux.rs)、`Mux.Cool`風の独自フレーム
   設計)で1本のセッションの中に複数の独立したサブストリームを多重化可能。
 - `secure_channel`(独自AEADフレーミング)経由の代替経路も併存
@@ -165,7 +170,7 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
 
 ## Current Status (English summary)
 
-As of 2026-09-29 (implementation phase 17, `cargo test`: 83/83 passing):
+As of 2026-09-30 (implementation phase 18, `cargo test`: 84/84 passing):
 
 - REALITY authentication (X25519 ECDH) → a real TLS 1.3 handshake that
   borrows a genuine certificate chain live from the camouflage target site
@@ -174,6 +179,12 @@ As of 2026-09-29 (implementation phase 17, `cargo test`: 83/83 passing):
   without forking rustls itself, certificate chains are now cached with a
   TTL) → VLESS UUID validation → real TCP/UDP/Mux relaying, all wired up
   and verified end-to-end with a real `rustls` client.
+- Browser TLS fingerprint mimicry (uTLS-equivalent, partial): cipher suite
+  order, key-exchange groups, ALPN and the signature-algorithm list are
+  tuned to look like Chrome, within what rustls's public API allows
+  (extension ordering and GREASE remain out of reach). Extracted into the
+  `open-runo-tls-fingerprint` crate in
+  [RPoem](https://github.com/aon-co-jp/RPoem) so other projects can reuse it.
 - `Command::Mux` ([`src/mux.rs`](src/mux.rs), a `Mux.Cool`-inspired custom
   frame design) multiplexes several independent sub-streams over one
   session.
@@ -187,6 +198,5 @@ As of 2026-09-29 (implementation phase 17, `cargo test`: 83/83 passing):
 
 See [`CLAUDE.md`](CLAUDE.md) ("HANDOFF") for open items and known
 limitations, and [`PORTING.md`](PORTING.md) for the detailed design
-history (notably phase 27: two deadlock bugs discovered and fixed while
-implementing `Command::Mux`, found by actually running the tests rather
-than assuming the design was correct).
+history (notably phase 28: why the `craftls` fork wasn't adopted, and the
+partial fingerprint-mimicry scope that rustls's public API allows).

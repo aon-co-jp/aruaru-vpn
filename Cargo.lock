@@ -222,7 +222,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -247,6 +247,7 @@ dependencies = [
  "egui",
  "hkdf",
  "hmac",
+ "open-runo-tls-fingerprint",
  "rand 0.10.3",
  "rand_core 0.10.1",
  "rcgen",
@@ -2739,6 +2740,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
+name = "open-runo-tls-fingerprint"
+version = "0.1.0"
+source = "git+https://github.com/aon-co-jp/RPoem.git#a958895b73cff605a0600c7e4dd514f7b00c4922"
+dependencies = [
+ "rustls",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3227,7 +3237,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3652,7 +3662,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.5",
  "windows-sys 0.61.2",
