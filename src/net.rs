@@ -137,11 +137,17 @@ where
 ///
 /// `camouflage_port`は偽装先サイトへ証明書取得のために実際に接続する
 /// ポート(実運用では443、テストではモックTLSサーバーの任意ポート)。
+///
+/// `cert_cache`(実装フェーズ17): 証明書チェーンの取得は接続のたびに
+/// ライブ接続するとレイテンシ・偽装先への負荷が増えるため、
+/// [`cert_clone::CertChainCache`]でキャッシュする(本物のXray-core
+/// REALITYの`CacheManager`相当、`PORTING.md`「27.」参照)。
 pub async fn accept_and_route_cert_cloned(
     listener: &TcpListener,
     identity: Arc<ServerIdentity>,
     allowed_client_keys: &crate::reality_auth::AllowedClientKeys,
     camouflage_port: u16,
+    cert_cache: &cert_clone::CertChainCache,
 ) -> std::io::Result<Option<tokio_rustls::server::TlsStream<PrefixedStream<TcpStream>>>> {
     let (mut client_stream, _peer_addr) = listener.accept().await?;
     let record = read_exactly_one_tls_record(&mut client_stream).await?;
@@ -173,8 +179,9 @@ pub async fn accept_and_route_cert_cloned(
     let auth_key = identity.derive_cert_clone_auth_key(client_pub);
     let camouflage_target = sni.unwrap_or_else(|| "www.microsoft.com".to_owned());
 
-    let real_cert_chain =
-        cert_clone::fetch_real_certificate_chain(&camouflage_target, camouflage_port).await?;
+    let real_cert_chain = cert_cache
+        .get_or_fetch(&camouflage_target, camouflage_port)
+        .await?;
     let acceptor = cert_clone::build_cloned_server_acceptor(real_cert_chain, auth_key)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
@@ -196,7 +203,7 @@ pub async fn handle_relay_session_cert_cloned<F, Fut>(
     dial_destination: F,
 ) -> std::io::Result<()>
 where
-    F: FnOnce(Address, u16) -> Fut,
+    F: Fn(Address, u16) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
 {
     handle_relay_session(tls_stream, allowed_uuids, dial_destination).await
@@ -227,15 +234,19 @@ where
 /// `client_stream`は`AsyncRead`/`AsyncWrite`を実装する任意のストリーム型
 /// (実TCP接続そのものだけでなく、実装フェーズ15の`cert_clone`が返す
 /// TLS 1.3ストリームもここへそのまま渡せる、`handle_relay_session_cert_cloned`
-/// 参照)。
+/// 参照)。`Send + 'static`は`Command::Mux`(実装フェーズ17、`mux.rs`)が
+/// サブストリームごとにタスクを`tokio::spawn`するために必要。
+///
+/// `dial_destination`は`FnOnce`ではなく`Fn`(`Command::Mux`はサブストリーム
+/// ごとに複数回呼び出すため)。
 pub async fn handle_relay_session<S, F, Fut>(
     mut client_stream: S,
     allowed_uuids: &AllowedUuids,
     dial_destination: F,
 ) -> std::io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin,
-    F: FnOnce(Address, u16) -> Fut,
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: Fn(Address, u16) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
 {
     let mut buf = vec![0u8; 4096];
@@ -281,10 +292,15 @@ where
             Ok(())
         }
         Command::Udp => relay_udp(client_stream, address, port, leftover_payload).await,
-        Command::Mux => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "MUX command is not implemented yet",
-        )),
+        Command::Mux => {
+            // 最初のVLESSリクエストヘッダの直後に既に届いていたバイト列
+            // (`leftover_payload`)は、Muxフレームストリームの先頭部分
+            // そのものなので、`PrefixedStream`で「巻き戻して」から
+            // `mux::handle_mux_session`へ渡す(`accept_and_route`が
+            // ClientHelloを巻き戻すのと同じ手法)。
+            let prefixed = PrefixedStream::new(leftover_payload, client_stream);
+            crate::mux::handle_mux_session(prefixed, dial_destination).await
+        }
     }
 }
 
@@ -306,7 +322,7 @@ pub async fn handle_relay_session_secure<F, Fut>(
     dial_destination: F,
 ) -> std::io::Result<()>
 where
-    F: FnOnce(Address, u16) -> Fut,
+    F: Fn(Address, u16) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<TcpStream>>,
 {
     let (mut writer, mut reader) = secure_channel::responder_channel(client_stream, channel_keys);
@@ -375,10 +391,16 @@ where
             )
             .await
         }
-        Command::Mux => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "MUX command is not implemented yet",
-        )),
+        Command::Mux => {
+            writer.send(&vless::build_response_header(version)).await?;
+            crate::mux::handle_mux_over_secure_channel(
+                &mut writer,
+                &mut reader,
+                leftover_payload,
+                dial_destination,
+            )
+            .await
+        }
     }
 }
 
@@ -981,6 +1003,101 @@ mod tests {
         server_task.await.unwrap().unwrap();
     }
 
+    /// VLESS `Command::Mux`(実装フェーズ17)が、`secure_channel`(暗号化
+    /// フレーム単位の通信路)経由でも実際に動作することを確認する統合
+    /// テスト。`secure_channel`は「1メッセージ=1フレーム本体」という前提
+    /// のため、Muxフレームには長さプレフィックスを付けない
+    /// (`handle_mux_over_secure_channel`のドキュメント参照)。
+    #[tokio::test]
+    async fn relay_session_secure_forwards_mux_command_to_real_destination() {
+        use crate::reality_auth::ClientEphemeralKeypair;
+
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = destination_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let identity = Arc::new(ServerIdentity::generate([55u8; 32]));
+        let client_ephemeral = ClientEphemeralKeypair::generate([56u8; 32]);
+        let auth_tag = client_ephemeral.derive_auth_tag(&identity.public_key());
+        let allowed_uuid = [21u8; 16];
+
+        let reality_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reality_addr = reality_listener.local_addr().unwrap();
+        let identity_for_server = Arc::clone(&identity);
+        let destination_port = destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let authenticated =
+                accept_and_route(&reality_listener, identity_for_server, |_| async {
+                    panic!("this test's client must always authenticate; camouflage path unused")
+                })
+                .await
+                .unwrap()
+                .expect("client must authenticate via REALITY");
+
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session_secure(
+                authenticated.stream,
+                &authenticated.channel_keys,
+                &allowed,
+                |_address, port| async move { TcpStream::connect(("127.0.0.1", port)).await },
+            )
+            .await
+        });
+
+        let mut client_tcp = TcpStream::connect(reality_addr).await.unwrap();
+        let client_hello = build_client_hello_with_key_share_for_tests(
+            &auth_tag,
+            "www.microsoft.com",
+            &client_ephemeral.public_key().to_bytes(),
+        );
+        client_tcp.write_all(&client_hello).await.unwrap();
+
+        let client_channel_keys = client_ephemeral.derive_channel_keys(&identity.public_key());
+        let (mut writer, mut reader) =
+            secure_channel::initiator_channel(client_tcp, &client_channel_keys);
+
+        // VLESSリクエストヘッダ(command=MUX)+最初のMuxフレーム(New)を、
+        // 同じ1メッセージにまとめて送る(`leftover_payload`として引き継がれる)。
+        let mut first_message = Vec::new();
+        first_message.push(0u8);
+        first_message.extend_from_slice(&allowed_uuid);
+        first_message.push(0u8); // addons_len = 0
+        first_message.push(3u8); // command = MUX
+        first_message.extend_from_slice(&0u16.to_be_bytes());
+        first_message.push(1u8);
+        first_message.extend_from_slice(&[0, 0, 0, 0]);
+
+        let new_frame = crate::mux::MuxFrame::new_stream(
+            1,
+            Address::Domain("127.0.0.1".to_owned()),
+            destination_port,
+            b"mux-over-secure-channel".to_vec(),
+        );
+        first_message.extend_from_slice(&crate::mux::encode_frame_body(&new_frame));
+
+        writer.send(&first_message).await.unwrap();
+
+        let response_header = reader.recv().await.unwrap();
+        assert_eq!(response_header, vec![0u8, 0u8]);
+
+        let reply_body = reader.recv().await.unwrap();
+        let reply = crate::mux::decode_frame_body(&reply_body).unwrap();
+        assert_eq!(reply.status, crate::mux::MuxStatus::Keep);
+        assert_eq!(reply.sub_id, 1);
+        assert_eq!(reply.payload, b"mux-over-secure-channel");
+
+        writer.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
     /// WireGuard相当のNoiseハンドシェイクを、実際のUDPソケット越しに行い、
     /// 完了後に暗号化データを送受信できることを確認する。
     #[tokio::test]
@@ -1050,6 +1167,7 @@ mod tests {
         let reality_addr = reality_listener.local_addr().unwrap();
         let identity = Arc::new(ServerIdentity::generate([95u8; 32]));
         let allowed_keys = crate::reality_auth::AllowedClientKeys::default();
+        let cert_cache = cert_clone::CertChainCache::new(std::time::Duration::from_secs(60));
 
         let server_task = tokio::spawn(async move {
             accept_and_route_cert_cloned(
@@ -1057,6 +1175,7 @@ mod tests {
                 identity,
                 &allowed_keys,
                 camouflage_port,
+                &cert_cache,
             )
             .await
         });
@@ -1148,6 +1267,7 @@ mod tests {
         let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let relay_addr = relay_listener.local_addr().unwrap();
         let destination_port = destination_addr.port();
+        let cert_cache = cert_clone::CertChainCache::new(std::time::Duration::from_secs(60));
 
         let server_task = tokio::spawn(async move {
             let tls_stream = accept_and_route_cert_cloned(
@@ -1155,6 +1275,7 @@ mod tests {
                 identity,
                 &allowed_keys,
                 camouflage_port,
+                &cert_cache,
             )
             .await
             .unwrap()
@@ -1203,6 +1324,77 @@ mod tests {
         assert_eq!(echoed, b"cert-cloned-pipeline-payload");
 
         client_tls.shutdown().await.unwrap();
+        server_task.await.unwrap().unwrap();
+    }
+
+    /// VLESS `Command::Mux`(実装フェーズ17)が、平文の`handle_relay_session`
+    /// 経由でも実際に動作することを確認する統合テスト(`mux.rs`自身の
+    /// テストは`handle_mux_session`を直接呼ぶが、ここではVLESSリクエスト
+    /// ヘッダの解析からMuxフレームへの引き継ぎ〈`leftover_payload`の
+    /// `PrefixedStream`巻き戻し〉まで含めて一気通貫で確認する)。
+    #[tokio::test]
+    async fn relay_session_forwards_mux_command_to_real_destination() {
+        let destination_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let destination_addr = destination_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = destination_listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                if let Ok(n) = stream.read(&mut buf).await {
+                    let _ = stream.write_all(&buf[..n]).await;
+                }
+            }
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_listener.local_addr().unwrap();
+        let allowed_uuid = [20u8; 16];
+        let destination_port = destination_addr.port();
+
+        let server_task = tokio::spawn(async move {
+            let (server_side_stream, _) = relay_listener.accept().await.unwrap();
+            let allowed = AllowedUuids::new([allowed_uuid]);
+            handle_relay_session(server_side_stream, &allowed, |_address, port| async move {
+                TcpStream::connect(("127.0.0.1", port)).await
+            })
+            .await
+        });
+
+        let mut client = TcpStream::connect(relay_addr).await.unwrap();
+
+        let mut vless_request = Vec::new();
+        vless_request.push(0u8);
+        vless_request.extend_from_slice(&allowed_uuid);
+        vless_request.push(0u8); // addons_len = 0
+        vless_request.push(3u8); // command = MUX
+        vless_request.extend_from_slice(&0u16.to_be_bytes()); // port(未使用)
+        vless_request.push(1u8); // address_type = IPv4(未使用)
+        vless_request.extend_from_slice(&[0, 0, 0, 0]);
+        client.write_all(&vless_request).await.unwrap();
+
+        let mut response_header = [0u8; 2];
+        client.read_exact(&mut response_header).await.unwrap();
+        assert_eq!(response_header, [0u8, 0u8]);
+
+        let new_frame = crate::mux::MuxFrame::new_stream(
+            1,
+            Address::Domain("127.0.0.1".to_owned()),
+            destination_port,
+            b"mux-over-plain-tcp".to_vec(),
+        );
+        client
+            .write_all(&crate::mux::encode_mux_frame(&new_frame))
+            .await
+            .unwrap();
+
+        let reply = crate::mux::read_one_mux_frame(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply.status, crate::mux::MuxStatus::Keep);
+        assert_eq!(reply.sub_id, 1);
+        assert_eq!(reply.payload, b"mux-over-plain-tcp");
+
+        client.shutdown().await.unwrap();
         server_task.await.unwrap().unwrap();
     }
 }

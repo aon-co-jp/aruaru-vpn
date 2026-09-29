@@ -144,16 +144,18 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
 
 ## 現在の到達点
 
-2026-09-29時点(実装フェーズ16完了、`cargo test`で74テスト全通過):
+2026-09-29時点(実装フェーズ17完了、`cargo test`で83テスト全通過):
 
 - REALITY認証(X25519 ECDH)→本物の証明書チェーンを偽装先サイトから
   実際に借用したTLS 1.3ハンドシェイク(`cert_clone`、
   [rustls](https://crates.io/crates/rustls)の公開拡張点を使い、rustls自体は
-  フォークせず実装)→VLESS UUID検証→実TCP/UDP中継、まで実配線・
-  動作確認済み(本物の`rustls`クライアントを使ったフルパイプライン
-  end-to-endテストが実際に成功)。
+  フォークせず実装、証明書チェーンはTTL付きキャッシュを使用)→VLESS UUID
+  検証→実TCP/UDP/Mux中継、まで実配線・動作確認済み(本物の`rustls`
+  クライアントを使ったフルパイプラインend-to-endテストが実際に成功)。
+- `Command::Mux`([`src/mux.rs`](src/mux.rs)、`Mux.Cool`風の独自フレーム
+  設計)で1本のセッションの中に複数の独立したサブストリームを多重化可能。
 - `secure_channel`(独自AEADフレーミング)経由の代替経路も併存
-  (`Command::Udp`対応済み)。
+  (`Command::Udp`/`Mux`対応済み)。
 - 鍵管理GUI([`src/bin/keys_gui.rs`](src/bin/keys_gui.rs)、egui/eframe+rfd)。
 - 透明性告知文(日英+主要30言語、AIによる自己レビュー実施済み・
   ネイティブ検証は未実施)。
@@ -163,17 +165,20 @@ README.md/CLAUDE.md/PORTING.mdが未整備で(`open-directx`はGitHub上に空
 
 ## Current Status (English summary)
 
-As of 2026-09-29 (implementation phase 16, `cargo test`: 74/74 passing):
+As of 2026-09-29 (implementation phase 17, `cargo test`: 83/83 passing):
 
 - REALITY authentication (X25519 ECDH) → a real TLS 1.3 handshake that
   borrows a genuine certificate chain live from the camouflage target site
   (`cert_clone`, built on [rustls](https://crates.io/crates/rustls)'s public
   extension points — `SigningKey`, `ServerCertVerifier`, `SupportedKxGroup` —
-  without forking rustls itself) → VLESS UUID validation → real TCP/UDP
-  relaying, all wired up and verified end-to-end with a real `rustls`
-  client.
+  without forking rustls itself, certificate chains are now cached with a
+  TTL) → VLESS UUID validation → real TCP/UDP/Mux relaying, all wired up
+  and verified end-to-end with a real `rustls` client.
+- `Command::Mux` ([`src/mux.rs`](src/mux.rs), a `Mux.Cool`-inspired custom
+  frame design) multiplexes several independent sub-streams over one
+  session.
 - An alternative path over `secure_channel` (a custom AEAD framing) also
-  exists (`Command::Udp` supported there too).
+  exists (`Command::Udp`/`Mux` supported there too).
 - A native key-management GUI ([`src/bin/keys_gui.rs`](src/bin/keys_gui.rs),
   egui/eframe + rfd).
 - The transparency notice (Japanese/English plus ~30 languages), with an
@@ -182,6 +187,6 @@ As of 2026-09-29 (implementation phase 16, `cargo test`: 74/74 passing):
 
 See [`CLAUDE.md`](CLAUDE.md) ("HANDOFF") for open items and known
 limitations, and [`PORTING.md`](PORTING.md) for the detailed design
-history (notably phases 25–26: two fundamental incompatibilities discovered
-and resolved while integrating a standard TLS 1.3 client with the
-certificate-cloning path).
+history (notably phase 27: two deadlock bugs discovered and fixed while
+implementing `Command::Mux`, found by actually running the tests rather
+than assuming the design was correct).

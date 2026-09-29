@@ -6,6 +6,7 @@ pub mod amnezia;
 pub mod cert_clone;
 pub mod integration;
 pub mod key_storage;
+pub mod mux;
 pub mod net;
 pub mod reality;
 pub mod reality_auth;

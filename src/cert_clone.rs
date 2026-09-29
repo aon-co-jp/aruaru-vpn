@@ -162,6 +162,69 @@ pub async fn fetch_real_certificate_chain(
     Ok(chain)
 }
 
+/// `fetch_real_certificate_chain`の結果をキャッシュする(実装フェーズ17)。
+///
+/// **導入理由**: 本物のXray-core REALITYは`CacheManager`
+/// (`FindCachedProfileByDest`等)で偽装先サイトのハンドシェイク結果を
+/// キャッシュし、接続のたびにライブでハンドシェイクし直すことはしない
+/// (`PORTING.md`「25.」の調査で判明)。証明書チェーンの取得(実TLS接続)は
+/// 数十〜数百ミリ秒かかるうえ偽装先サイトへの負荷にもなるため、接続の
+/// たびに毎回ライブ取得していた実装フェーズ15・16の設計を改め、TTL付き
+/// キャッシュを導入する。
+///
+/// 証明書チェーンは公開情報であり、キャッシュしても秘密性の問題は無い
+/// (`fetch_real_certificate_chain`のドキュメント参照)。TTLを設けるのは、
+/// 偽装先サイトが証明書を更新した場合に追従するため。
+pub struct CertChainCache {
+    entries: std::sync::Mutex<
+        std::collections::HashMap<
+            (String, u16),
+            (std::time::Instant, Vec<CertificateDer<'static>>),
+        >,
+    >,
+    ttl: std::time::Duration,
+}
+
+impl CertChainCache {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            entries: std::sync::Mutex::new(std::collections::HashMap::new()),
+            ttl,
+        }
+    }
+
+    /// キャッシュに有効なエントリがあればそれを返し、無ければ実際に
+    /// `fetch_real_certificate_chain`でライブ取得してキャッシュに保存する。
+    pub async fn get_or_fetch(
+        &self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> io::Result<Vec<CertificateDer<'static>>> {
+        let key = (dest_host.to_owned(), dest_port);
+
+        {
+            let entries = self
+                .entries
+                .lock()
+                .expect("cache mutex must not be poisoned");
+            if let Some((fetched_at, chain)) = entries.get(&key) {
+                if fetched_at.elapsed() < self.ttl {
+                    return Ok(chain.clone());
+                }
+            }
+        }
+
+        let chain = fetch_real_certificate_chain(dest_host, dest_port).await?;
+
+        let mut entries = self
+            .entries
+            .lock()
+            .expect("cache mutex must not be poisoned");
+        entries.insert(key, (std::time::Instant::now(), chain.clone()));
+        Ok(chain)
+    }
+}
+
 /// サーバー側の署名鍵(実装フェーズ15)。本物の秘密鍵は持たず、
 /// `auth_key`によるHMAC-SHA512を「署名」として返す。
 #[derive(Debug)]
