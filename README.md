@@ -1,3 +1,5 @@
+> Latest translations / 翻訳の最新版: [0-LATEST-TRANSLATIONS.md](0-LATEST-TRANSLATIONS.md)
+
 # aruaru-vpn
 
 [Outline VPN](https://getoutline.org/)(Jigsaw/Google製、Shadowsocksベース)・
